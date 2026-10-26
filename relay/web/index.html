@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101b2a">
+  <title>Relay — Agent session command center</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="rail" aria-label="Primary navigation">
+      <a class="brand" href="#sessions" aria-label="Relay home"><span class="brand-mark">R</span><span>relay</span></a>
+      <div class="rail-label">Workspace</div>
+      <button class="nav-item active" data-view="sessions"><span class="nav-icon">◈</span><span>Sessions</span><span id="nav-count" class="nav-count">—</span></button>
+      <button class="nav-item" data-view="repro"><span class="nav-icon">⌁</span><span>Repro</span></button>
+      <div class="rail-bottom"><span class="live-dot"></span><span id="connection-label">Connecting to local service</span><span class="privacy-note">LOCAL · PRIVATE</span></div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="breadcrumbs"><span>Workspace</span><span class="crumb-sep">/</span><strong id="page-label">Sessions</strong></div>
+        <div class="top-actions"><label class="demo-switch"><input id="demo-toggle" type="checkbox"><span class="switch"></span><span>Demo data</span></label><span class="top-divider"></span><span class="service-state"><i id="service-dot"></i><span id="service-text">Connecting</span></span></div>
+      </header>
+
+      <section id="sessions-view" class="view">
+        <div class="page-heading">
+          <div><div class="eyebrow">AGENT OPERATIONS</div><h1>Session command center</h1><p>Follow work across Codex and Claude Code, with the source behind every status.</p></div>
+          <div class="updated-block"><span class="updated-kicker">LAST SNAPSHOT</span><strong id="updated-at">Waiting for local service</strong><span class="refresh-mark">↻ <span>5 sec refresh</span></span></div>
+        </div>
+
+        <div class="metric-row" id="metrics" aria-label="Session counts"></div>
+
+        <div class="workspace-grid">
+          <section class="session-column">
+            <div class="section-title-row"><div><div class="eyebrow">YOUR WORK</div><h2>Sessions <span id="result-count" class="subtle-count"></span></h2></div><button class="icon-button" id="refresh-button" title="Refresh snapshot" aria-label="Refresh snapshot">↻</button></div>
+            <div class="filterbar">
+              <label class="searchbox"><span>⌕</span><input id="search" type="search" placeholder="Search tasks, projects, IDs…" autocomplete="off"></label>
+              <label class="select-wrap"><span class="sr-only">Filter provider</span><select id="provider-filter"><option value="all">All providers</option><option value="codex">Codex</option><option value="claude">Claude Code</option></select><b>⌄</b></label>
+              <label class="select-wrap"><span class="sr-only">Filter status</span><select id="status-filter"><option value="all">All states</option><option value="running">Running</option><option value="waiting">Waiting</option><option value="completed">Completed</option><option value="failed">Failed</option><option value="interrupted">Interrupted</option><option value="stale">Stale</option><option value="unknown">Unknown</option></select><b>⌄</b></label>
+              <label class="select-wrap project-select"><span class="sr-only">Filter project</span><select id="project-filter"><option value="all">All projects</option></select><b>⌄</b></label>
+            </div>
+            <div id="session-tree" class="session-tree" aria-live="polite"></div>
+            <div class="tree-foot"><span>SESSION ID</span><span>LAST OBSERVED ACTIVITY</span></div>
+          </section>
+
+          <aside class="attention-column">
+            <div class="attention-card">
+              <div class="attention-head"><div><div class="eyebrow">NEEDS A LOOK</div><h2>Attention queue</h2></div><span id="attention-count" class="attention-count">0</span></div>
+              <p class="attention-intro">Sessions that may need your input or a check-in.</p>
+              <div id="attention-list" class="attention-list"></div>
+              <div class="attention-legend"><span><i class="legend-dot amber"></i>Waiting on input</span><span><i class="legend-dot red"></i>Failed</span></div>
+            </div>
+            <div class="provider-card"><div class="provider-card-head"><div><div class="eyebrow">DATA SOURCES</div><h3>Provider health</h3></div><span class="lock-mark">⌑</span></div><div id="provider-list" class="provider-list"><div class="empty-note">Checking local sources…</div></div><div class="local-foot"><span class="lock-icon">⌑</span><span>Session data stays on this Mac</span></div></div>
+            <div class="quiet-note"><span>i</span><p>Relay observes local session metadata only. Status includes its evidence source; missing data is shown as unknown.</p></div>
+          </aside>
+        </div>
+      </section>
+
+      <section id="repro-view" class="view hidden">
+        <div class="page-heading repro-heading"><div><div class="eyebrow">TEST THE REPORT</div><h1>Repro workspace</h1><p>Turn a bug report into a failing test, then verify the same test after a fix.</p></div><div class="workflow-badge"><span class="workflow-icon">⌁</span><span>Python · pytest · isolated run</span></div></div>
+        <div class="repro-layout">
+          <section class="repro-form-card">
+            <div class="section-title-row"><div><div class="eyebrow">NEW REPRO</div><h2>Start with the issue</h2></div><span class="step-pill">01 / 03</span></div>
+            <label class="field-label" for="issue-input">Bug report</label><textarea id="issue-input" rows="5" placeholder="Describe the observed behavior, expected result, and a way to trigger the bug…"></textarea>
+            <label class="field-label" for="repo-input">Repository path <span class="optional">OPTIONAL FOR DEMO</span></label><input id="repo-input" type="text" placeholder="/path/to/local/repository" autocomplete="off" spellcheck="false">
+            <div class="field-label provider-label">Test generator</div><div class="provider-choice"><label><input type="radio" name="repro-provider" value="claude"><span class="provider-choice-card"><b class="choice-icon claude-icon">C</b><span><strong>Claude Code</strong><small>Uses selected local provider</small></span><i class="radio-dot"></i></span></label><label><input type="radio" name="repro-provider" value="openai"><span class="provider-choice-card"><b class="choice-icon openai-icon">◎</b><span><strong>OpenAI-compatible</strong><small>Uses configured endpoint</small></span><i class="radio-dot"></i></span></label><label><input type="radio" name="repro-provider" value="demo" checked><span class="provider-choice-card"><b class="choice-icon demo-icon">D</b><span><strong>Deterministic demo</strong><small>Prewritten fixture · no model call</small></span><i class="radio-dot"></i></span></label></div>
+            <div class="send-note"><span>↗</span><p>When you generate a test, selected repository snippets are sent to the chosen provider. Runs happen in Docker with no host fallback.</p></div>
+            <button id="generate-button" class="primary-button"><span>Generate failing test</span><b>→</b></button><div id="repro-error" class="form-error" role="alert"></div>
+          </section>
+          <section class="repro-result-card"><div class="result-placeholder" id="repro-placeholder"><div class="placeholder-art"><span>R</span><i>⌁</i></div><h2>Your reproduction will appear here</h2><p>Relay will show the generated test, baseline result, and verification evidence together.</p><div class="placeholder-list"><span><b>1</b> Generate a focused test</span><span><b>2</b> Confirm it catches the bug</span><span><b>3</b> Verify after the fix</span></div></div><div id="repro-job" class="hidden"></div></section>
+        </div>
+        <div class="repro-safety"><span>⌑</span><div><strong>Scoped and isolated</strong><p>Python and pytest only. The selected source is copied into a bounded workspace; generated code runs in Docker with network access disabled. The original repository is never edited.</p></div></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="detail-dialog" class="detail-dialog"><div id="detail-content"></div></dialog>
+  <div id="toast" class="toast" role="status"></div>
+  <script src="app.js" defer></script>
+</body>
+</html>

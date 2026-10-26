@@ -138,3 +138,13 @@ def test_secret_and_tool_arguments_are_not_exposed(tmp_path):
     assert "supersecretvalue" not in s.task
     assert "jane@example.com" not in s.task
     assert s.last_activity == "Used Bash"
+
+
+def test_local_cli_metadata_is_not_a_task_name(tmp_path):
+    home = tmp_path / "claude"
+    path = home / "projects/demo/session.jsonl"
+    for message in ["<local-command-caveat>The command below was run directly in Claude Code</local-command-caveat><command-name>/login</command-name>", "[Image: source: /tmp/screenshot.png]", "Fix the cache invalidation bug"]:
+        _line(path, {"type": "user", "sessionId": "session", "cwd": "/work/cache", "message": {"content": message}})
+    session = scan_claude(home, 10)[0]
+    assert "Fix the cache invalidation bug" in session.suggested_name
+    assert "login" not in session.suggested_name

@@ -10,3 +10,5 @@ dist/
 *.app/
 .DS_Store
 .playwright-mcp/
+
+.native-check/

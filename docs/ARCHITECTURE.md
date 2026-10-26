@@ -1,6 +1,6 @@
 # Architecture and implementation findings
 
-Relay runs a loopback FastAPI service, a static vanilla-JavaScript dashboard, and an optional macOS status-item app. The Python package owns session collection, alias storage, the API, and Repro jobs. The Swift app owns the menu-bar item, starts the local service when no healthy service is responding, and hosts the same dashboard in a `WKWebView`.
+Relay and Repro are separate native SwiftUI/AppKit applications backed by one shared local Python engine. Relay owns session naming, monitoring and the macOS menu bar. Repro owns the native issue-to-regression workflow. No WebKit or HTML view is used in either application. The optional web surface is retained for developer diagnostics only.
 
 ## Session collection
 
@@ -17,13 +17,15 @@ These implementation details reflect edge cases found while exercising the parse
 
 `relay/store.py` persists display aliases in Relay's local state directory, defaulting to `~/.local/share/relay`. An alias overlays the session display name without modifying provider records. Explicit Codex sync uses a short-lived Codex app-server request to set a thread name; it does not edit the session database. Claude rename remains a user-run `/rename` command copied by the UI.
 
-## Dashboard and native shell
+## Native applications
 
-The dashboard polls `/api/sessions` every five seconds and backs off after failures. Demo sessions are requested only when the user enables **Demo data**. Search and provider, status, and project filters operate on the current snapshot. Parent links are drawn within a provider; malformed cycles are broken for display so each session can appear once in the tree. Untrusted session and job values are inserted with DOM text nodes, not HTML parsing.
+`native/Shared.swift` supplies typed session/job models and an asynchronous engine client. Both apps check health before starting the shared engine and reconnect to it. GUI launches include standard tool paths for Claude and Docker. The shared service remains alive if a client closes.
 
-Status labels include their `status_source` in session details. Token values appear only when a provider reports a valid count. Resume strings and Claude rename syntax are copied to the clipboard; Relay does not execute shell commands.
+`native/Relay.swift` provides a primary 390×560 menu-bar popover backed by system Liquid Glass on macOS 26+ (native vibrancy fallback), plus an expanded SwiftUI session browser and inspector, native naming controls, filters, parent/child indicators and an AppKit menu-bar item. Session details show status provenance. Codex title sync requires an explicit confirmation; Claude rename and resume commands are clipboard actions.
 
-`native/Relay.swift` polls the local health and session endpoints, presents real session counts and a short attention/recent list in the status menu, and opens the dashboard in a non-persistent WebKit view. It checks health before starting a backend and owns only the process it launches. `scripts/build-macos.sh` compiles the app with the system Swift compiler and writes the source checkout path into the bundle; the Python backend is not embedded.
+`native/Repro.swift` provides a separate menu-bar quick panel and expanded workspace with a native repository folder picker, issue editor, generator selector, job progress, multiline test preview and baseline/verification evidence. Downloads use a native save dialog. It never edits the original repository or runs generated tests on the host.
+
+`scripts/build-macos.sh` compiles both apps with the system Swift compiler and ad-hoc signs the bundles. They retain the checkout path and require its Python environment. Portable runtime bundling, notarization and distribution installers remain future work.
 
 ## Repro execution boundary
 

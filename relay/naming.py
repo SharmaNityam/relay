@@ -19,6 +19,8 @@ def clean_text(value: str, limit: int = 240) -> str:
     # These metadata blocks are useful to the adapter but make poor task titles.
     text = re.sub(r"(?is)<environment_context\b[^>]*>.*?</environment_context\s*>", " ", text)
     text = re.sub(r"(?is)<system-reminder\b[^>]*>.*?</system-reminder\s*>", " ", text)
+    text = re.sub(r"(?is)<(?:local-command-caveat|local-command-stdout|command-name|command-message|command-args)\b[^>]*>.*?</(?:local-command-caveat|local-command-stdout|command-name|command-message|command-args)\s*>", " ", text)
+    text = re.sub(r"\[Image:\s*source:[^\]]*\]", " ", text)
     text = re.sub(r"```.*?```", " ", text, flags=re.S)
     text = re.sub(r"`([^`]*)`", r"\1", text)
     text = re.sub(r"!\[[^]]*\]\([^)]*\)", " ", text)
@@ -35,6 +37,8 @@ def suggest_name(session: Session) -> str:
     project = clean_text(session.project, 48)
     role = clean_text(session.role, 32)
     task = clean_text(session.task, 100)
+    if task and not any(c.isalpha() for c in task):
+        task = ""
     # Task descriptions often begin with boilerplate; retain the first useful sentence.
     task = re.split(r"(?<=[.!?])\s+", task, maxsplit=1)[0].strip()
     if not task:

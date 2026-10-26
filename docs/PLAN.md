@@ -1,5 +1,7 @@
 # Relay implementation plan
 
+> The original shell plan below was superseded by [the native system application plan](NATIVE_PLAN.md). Both app UIs now target SwiftUI/AppKit.
+
 Working name Relay. Separate checkout from Specimen. First release supports Codex and Claude Code only. Repro means the original bug-report → generated failing test → unchanged-test fix verification workflow.
 
 ## Product modules

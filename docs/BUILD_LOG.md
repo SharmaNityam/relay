@@ -31,3 +31,24 @@ The initial UI/native packaging pass did not run the project test suite; final p
 - Final UI correction preserves code newlines and an exit code of zero.
 
 - `uv build` succeeded; the wheel includes all three dashboard assets. Final macOS app build and `git diff --check` passed.
+
+## Native application correction
+
+The user requires system applications, so the original WebKit shell is replaced with two SwiftUI/AppKit clients. `native/Shared.swift` provides typed local engine communication. See NATIVE_PLAN.md.
+
+Claude Code subscription login was confirmed working. The earlier `--bare` flag intentionally excluded OAuth; this was an integration error, not a reason to ask for further login. Replaced it with `--safe-mode` and tested a real Haiku-generated regression on a disposable Python fixture: baseline reproduced an assertion failure; after a source fix, the identical generated test passed (`verified`). No private project was sent.
+
+Two Claude Code Haiku workers implemented the native client files in parallel, with a maximum $2 API-equivalent budget each. The parent handles shared engine integration, packaging, and acceptance.
+
+### Final native/menu-bar acceptance (2026-10-27 IST)
+
+- Both app bundles compile and ad-hoc sign. Neither native client imports or links WebKit.
+- Three Claude Code Haiku implementation workers completed for approximately $0.130 API-equivalent reported cost total (native Relay, native Repro, glass popover), excluding the tiny live-generation smoke. The parent verified and corrected API contract mismatches.
+- Relay’s real Liquid Glass popover was inspected visually in synthetic mode; running/waiting/failed pills, provider/task cards, attention queue and workspace actions rendered. Clicking a child selected its native inspector. Real sessions were also collected; no real-data screenshot was saved.
+- Repro’s native demo reached `reproduced`, then `verified` with unchanged test bytes and displayed exit 0. Native progress correctly leaves Verify incomplete before the source fix. The native evidence-save dialog opened.
+- The native typed-client integration check passed: six synthetic sessions, queued response acknowledgement decoding, assertion-failing baseline, passing unchanged test after fixture fix, and ZIP evidence bytes.
+- Engine regressions: **87 passed**, one dependency deprecation warning (7.43 seconds).
+- The earlier WebKit/dashboard findings above are historical, superseded by this native acceptance. The local web surface is developer diagnostics only.
+- Real Codex native title mutation is still tested with a mocked RPC handshake; unrelated live provider sessions were not renamed.
+
+- Cold-start acceptance: stopped the manually started engine and opened Relay; its native launcher brought the engine online and reported Docker available. The native typed-client flow also passed against this GUI-launched engine.

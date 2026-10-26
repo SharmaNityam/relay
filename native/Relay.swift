@@ -1,256 +1,1070 @@
 import AppKit
-import WebKit
+import Combine
 import Foundation
+import SwiftUI
 
-private let relayBaseURL = URL(string: "http://127.0.0.1:9778")!
+// Relay: menu bar popover as the primary surface, with an expanded native workspace window as a secondary view.
+// All data flows through the shared EngineClient; there is no WebKit or HTML.
 
-final class RelayApp: NSObject, NSApplicationDelegate, WKNavigationDelegate {
-    private var statusItem: NSStatusItem!
+private let attentionStatuses: Set<String> = ["attention", "needs_attention", "waiting", "blocked"]
+private let errorStatuses: Set<String> = ["error", "failed", "failure"]
+private let runningStatuses: Set<String> = ["running", "active", "working", "busy"]
+private let pollInterval: UInt64 = 5_000_000_000
+
+func needsAttention(_ status: String) -> Bool {
+    let value = status.lowercased()
+    return attentionStatuses.contains(value) || errorStatuses.contains(value)
+}
+
+func statusColor(_ status: String) -> Color {
+    let value = status.lowercased()
+    if errorStatuses.contains(value) { return .red }
+    if attentionStatuses.contains(value) { return .orange }
+    switch value {
+    case "running", "active", "working", "busy", "ok", "healthy", "up": return .green
+    case "idle", "done", "completed", "complete", "finished": return .secondary
+    default: return .gray
+    }
+}
+
+// Round-robins providers so Claude and Codex both appear, then returns the chosen tasks newest first.
+func fairRecent(_ sessions: [RelaySession], limit: Int) -> [RelaySession] {
+    func priority(_ s: RelaySession) -> Int {
+        if runningStatuses.contains(s.status) { return 0 }
+        if needsAttention(s.status) { return 1 }
+        return 2
+    }
+    func before(_ a: RelaySession, _ b: RelaySession) -> Bool {
+        if priority(a) != priority(b) { return priority(a) < priority(b) }
+        return (a.last_event_at ?? "") > (b.last_event_at ?? "")
+    }
+    let newestFirst = sessions.sorted(by: before)
+    var buckets: [String: [RelaySession]] = [:]
+    for session in newestFirst { buckets[session.provider, default: []].append(session) }
+    let providers = buckets.keys.sorted()
+    var picked: [RelaySession] = []
+    var round = 0
+    while picked.count < limit {
+        var added = false
+        for provider in providers {
+            guard let list = buckets[provider], round < list.count, picked.count < limit else { continue }
+            picked.append(list[round])
+            added = true
+        }
+        if !added { break }
+        round += 1
+    }
+    return picked.sorted(by: before)
+}
+
+func providerLabel(_ session: RelaySession) -> String {
+    session.provider.lowercased().contains("claude") ? "Claude Code" : "Codex"
+}
+
+@MainActor
+final class SessionModel: ObservableObject {
+    @Published private(set) var snapshot: SessionSnapshot?
+    @Published private(set) var demo = false
+    @Published private(set) var busy = false
+    @Published private(set) var loading = false
+    @Published var errorMessage: String?
+    @Published var selectedKey: String?
+    @Published var search = ""
+    @Published var providerFilter = "all"
+    @Published var statusFilter = "all"
+
+    private var pollTask: Task<Void, Never>?
+    private var refreshTask: Task<Void, Never>?
+
+    var sessions: [RelaySession] { snapshot?.sessions ?? [] }
+    var providers: [ProviderHealth] { snapshot?.providers ?? [] }
+    var counts: [String: Int] { snapshot?.counts ?? [:] }
+    var providerOptions: [String] { Set(sessions.map(\.provider)).sorted() }
+    var statusOptions: [String] { Set(sessions.map(\.status)).sorted() }
+    var attentionSessions: [RelaySession] { sessions.filter { needsAttention($0.status) } }
+    var activeTasks: [RelaySession] { fairRecent(sessions, limit: 8) }
+    var runningSessions: [RelaySession] { sessions.filter { runningStatuses.contains($0.status.lowercased()) } }
+    var waitingSessions: [RelaySession] { sessions.filter { attentionStatuses.contains($0.status.lowercased()) } }
+    var failedSessions: [RelaySession] { sessions.filter { errorStatuses.contains($0.status.lowercased()) } }
+    var selectedSession: RelaySession? { sessions.first { $0.key == selectedKey } }
+
+    var visibleSessions: [RelaySession] {
+        let query = search.trimmingCharacters(in: .whitespaces).lowercased()
+        return sessions.filter { session in
+            (providerFilter == "all" || session.provider == providerFilter)
+                && (statusFilter == "all" || session.status == statusFilter)
+                && matches(session, query: query)
+        }
+    }
+
+    private func matches(_ session: RelaySession, query: String) -> Bool {
+        if query.isEmpty { return true }
+        let fields = [session.name, session.title, session.task, session.project, session.provider, session.status, session.id]
+        return fields.contains { $0.lowercased().contains(query) }
+    }
+
+    static func sessionPath(_ session: RelaySession, _ action: String) -> String {
+        "/api/sessions/\(EngineClient.component(session.provider))/\(EngineClient.component(session.id))/\(action)"
+    }
+
+    // Polling runs as one loop; startPolling is a no-op if it is already running.
+    func startPolling() {
+        guard pollTask == nil else { return }
+        pollTask = Task {
+            while !Task.isCancelled {
+                await self.refresh()
+                try? await Task.sleep(nanoseconds: pollInterval)
+            }
+        }
+    }
+
+    func refreshNow() {
+        Task { await refresh(restart: true) }
+    }
+
+    // Results from the previous mode are cleared immediately, before the new fetch.
+    func setDemo(_ value: Bool) {
+        guard value != demo else { return }
+        demo = value
+        snapshot = nil
+        selectedKey = nil
+        errorMessage = nil
+        refreshNow()
+    }
+
+    func clearFilters() {
+        search = ""
+        providerFilter = "all"
+        statusFilter = "all"
+    }
+
+    func reveal(_ key: String) {
+        clearFilters()
+        selectedKey = key
+    }
+
+    // Joins an in-flight refresh unless restart is requested, so overlapping callers share one request.
+    func refresh(restart: Bool = false) async {
+        if restart {
+            refreshTask?.cancel()
+            refreshTask = nil
+        }
+        if let inFlight = refreshTask {
+            await inFlight.value
+            return
+        }
+        let task = Task { await self.performRefresh() }
+        refreshTask = task
+        await task.value
+        if refreshTask == task { refreshTask = nil }
+    }
+
+    private func performRefresh() async {
+        if snapshot == nil { loading = true }
+        defer { loading = false }
+        do {
+            try await EngineClient.shared.ensureStarted()
+            let path = demo ? "/api/sessions?demo=1" : "/api/sessions"
+            let fresh: SessionSnapshot = try await EngineClient.shared.request(path)
+            guard !Task.isCancelled else { return }
+            snapshot = fresh
+            errorMessage = nil
+        } catch {
+            guard !Task.isCancelled else { return }
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func saveName(_ session: RelaySession, name: String) async {
+        await mutate {
+            _ = try await EngineClient.shared.data(Self.sessionPath(session, "name"), method: "PATCH", body: ["name": name])
+        }
+    }
+
+    // Only called from an explicit user action after a confirmation alert.
+    func syncName(_ session: RelaySession) async {
+        await mutate {
+            _ = try await EngineClient.shared.data(Self.sessionPath(session, "sync-name"), method: "POST", body: ["name": session.name])
+        }
+    }
+
+    private func mutate(_ work: () async throws -> Void) async {
+        guard !busy else { return }
+        busy = true
+        defer { busy = false }
+        do {
+            try await EngineClient.shared.ensureStarted()
+            try await work()
+            errorMessage = nil
+            await refresh(restart: true)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let model = SessionModel()
     private var window: NSWindow?
-    private var webView: WKWebView?
-    private var backend: Process?
-    private var pollTimer: Timer?
-    private var sessions: [[String: Any]] = []
-    private var snapshotCounts: [String: Int] = [:]
-    private var lastError = ""
-    private var backendPath: URL?
+    private var statusItem: NSStatusItem?
+    private let popover = NSPopover()
+    private var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
-        backendPath = readBackendPath()
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "R • —"
-        statusItem.button?.toolTip = "Relay — local agent session monitor"
-        statusItem.button?.target = self
-        statusItem.button?.action = #selector(showMenu(_:))
-        showDashboard()
-        ensureBackendAndPoll()
-    }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        pollTimer?.invalidate()
-        if let process = backend, process.isRunning {
-            process.terminate()
-            backend = nil
+        buildMainMenu()
+        buildPopover()
+        buildStatusItem()
+        model.objectWillChange
+            .sink { [weak self] _ in
+                // Update the status item after the pending change lands on the main actor.
+                Task { @MainActor [weak self] in self?.updateStatusItem() }
+            }
+            .store(in: &cancellables)
+        model.startPolling()
+        // One popover after launch so the menu bar surface is discoverable; the workspace window stays closed.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            self?.showPopover()
         }
     }
 
-    private func readBackendPath() -> URL? {
-        guard let resource = Bundle.main.url(forResource: "backend-path", withExtension: "txt"),
-              let raw = try? String(contentsOf: resource, encoding: .utf8) else { return nil }
-        let path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !path.isEmpty else { return nil }
-        return URL(fileURLWithPath: path, isDirectory: true)
+    // Closing the window keeps the menu bar item alive; the Dock icon or menu reopens it.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showWindow()
+        return true
     }
 
-    private func showDashboard() {
+    private func showWindow() {
         if window == nil {
-            let configuration = WKWebViewConfiguration()
-            configuration.websiteDataStore = .nonPersistent()
-            let view = WKWebView(frame: .zero, configuration: configuration)
-            view.navigationDelegate = self
-            view.allowsBackForwardNavigationGestures = false
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1160, height: 780),
-                                  styleMask: [.titled, .closable, .miniaturizable, .resizable],
-                                  backing: .buffered, defer: false)
-            window.title = "Relay — Session command center"
-            window.minSize = NSSize(width: 740, height: 520)
-            window.center()
-            window.contentView = view
-            self.window = window
-            self.webView = view
-            view.load(URLRequest(url: relayBaseURL))
+            let created = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 1100, height: 760),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                backing: .buffered,
+                defer: false
+            )
+            created.title = "Relay"
+            created.minSize = NSSize(width: 960, height: 620)
+            created.isReleasedWhenClosed = false
+            created.contentView = NSHostingView(rootView: RootView(model: model))
+            created.center()
+            created.setFrameAutosaveName("RelayMainWindow")
+            window = created
         }
-        window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
     }
 
-    @objc private func showMenu(_ sender: Any?) {
-        let menu = NSMenu()
-        let header = NSMenuItem(title: "Relay · \(sessions.count) sessions", action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
-        menu.addItem(NSMenuItem(title: lastError.isEmpty ? "Local service connected" : "Local service unavailable", action: nil, keyEquivalent: "").also { item in
-            item.isEnabled = false
-        })
-        menu.addItem(.separator())
-        let needsAttention = sessions.filter { status(of: $0) == "waiting" || status(of: $0) == "failed" }
-        let attentionHeader = NSMenuItem(title: "Needs attention · \(needsAttention.count)", action: nil, keyEquivalent: "")
-        attentionHeader.isEnabled = false
-        menu.addItem(attentionHeader)
-        if needsAttention.isEmpty {
-            let empty = NSMenuItem(title: "Nothing waiting for attention", action: nil, keyEquivalent: "")
-            empty.isEnabled = false
-            menu.addItem(empty)
-        } else {
-            for session in needsAttention.prefix(5) { menu.addItem(sessionMenuItem(session)) }
-        }
-        menu.addItem(.separator())
-        let recentHeader = NSMenuItem(title: "Recent sessions", action: nil, keyEquivalent: "")
-        recentHeader.isEnabled = false
-        menu.addItem(recentHeader)
-        let recent = sessions.sorted { timestamp(of: $0) > timestamp(of: $1) }.prefix(6)
-        if recent.isEmpty {
-            let empty = NSMenuItem(title: "No session metadata available", action: nil, keyEquivalent: "")
-            empty.isEnabled = false
-            menu.addItem(empty)
-        } else {
-            for session in recent { menu.addItem(sessionMenuItem(session)) }
-        }
-        menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Open Relay Dashboard", action: #selector(openDashboard(_:)), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Refresh now", action: #selector(refreshNow(_:)), keyEquivalent: "r"))
-        menu.addItem(NSMenuItem(title: "Quit Relay", action: #selector(quit(_:)), keyEquivalent: "q"))
-        for item in menu.items where item.action != nil { item.target = self }
-        statusItem.menu = menu
-        statusItem.button?.performClick(nil)
-        statusItem.menu = nil
+    private func buildMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu(title: "Relay")
+        appMenu.addItem(menuItem("Quit Relay", #selector(quitAction), key: "q"))
+        appItem.submenu = appMenu
+        mainMenu.addItem(appItem)
+
+        let viewItem = NSMenuItem()
+        let viewMenu = NSMenu(title: "View")
+        viewMenu.addItem(menuItem("Refresh", #selector(refreshAction), key: "r"))
+        viewMenu.addItem(menuItem("Open Repro", #selector(openRepro)))
+        viewItem.submenu = viewMenu
+        mainMenu.addItem(viewItem)
+
+        let windowItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(menuItem("Show Relay", #selector(openRelay), key: "0"))
+        windowItem.submenu = windowMenu
+        mainMenu.addItem(windowItem)
+
+        NSApp.mainMenu = mainMenu
     }
 
-    private func sessionMenuItem(_ session: [String: Any]) -> NSMenuItem {
-        let name = clean(session["alias"] as? String ?? session["display_name"] as? String ?? session["suggested_name"] as? String ?? session["title"] as? String ?? "Untitled session", limit: 62)
-        let project = clean(session["project"] as? String ?? "Unknown project", limit: 30)
-        let provider = clean(session["provider"] as? String ?? "unknown", limit: 14)
-        let item = NSMenuItem(title: "\(name) · \(project)  [\(status(of: session))]", action: #selector(openSession(_:)), keyEquivalent: "")
-        item.representedObject = session["key"] as? String ?? "\(provider):\(session["id"] as? String ?? "")"
-        item.toolTip = "\(provider) · \(clean(session["last_activity"] as? String ?? "No observed activity", limit: 120))"
+    // The popover is built once and observes the shared model, so polling never replaces it.
+    private func buildPopover() {
+        let actions = PopoverActions(
+            openWorkspace: { [weak self] in self?.openRelay() },
+            openSession: { [weak self] key in self?.openSession(key) },
+            openRepro: { [weak self] in self?.openRepro() },
+            quit: { NSApp.terminate(nil) }
+        )
+        let size = NSSize(width: 390, height: 560)
+        let controller = NSViewController()
+        controller.view = nativeGlassHost(RelayPopoverView(model: model, actions: actions), size: size)
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentSize = size
+        popover.contentViewController = controller
+    }
+
+    private func buildStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = item.button {
+            button.imagePosition = .imageLeading
+            button.target = self
+            button.action = #selector(togglePopover(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+        statusItem = item
+        updateStatusItem()
+    }
+
+    // Updates only the title, symbol, and tooltip. The button action and popover are left in place across polls.
+    private func updateStatusItem() {
+        guard let button = statusItem?.button else { return }
+        let running = model.runningSessions.count
+        let attention = model.attentionSessions.count
+        let symbol = attention > 0 ? "exclamationmark.triangle.fill" : "square.stack.3d.up"
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Relay")
+        button.title = running == 0 && attention == 0 ? "" : " \(running) · \(attention)"
+        let summary = "Relay: \(running) running, \(attention) need attention, \(model.sessions.count) sessions"
+        button.toolTip = summary
+        button.setAccessibilityLabel(summary)
+    }
+
+    @objc private func togglePopover(_ sender: Any?) {
+        if popover.isShown {
+            popover.performClose(sender)
+        } else {
+            showPopover()
+        }
+    }
+
+    private func showPopover() {
+        guard let button = statusItem?.button, !popover.isShown else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popover.contentViewController?.view.window?.makeKey()
+        model.refreshNow()
+    }
+
+    private func closePopover() {
+        if popover.isShown { popover.performClose(nil) }
+    }
+
+    private func openSession(_ key: String) {
+        closePopover()
+        model.reveal(key)
+        showWindow()
+    }
+
+    private func menuItem(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
         item.target = self
         return item
     }
 
-    private func ensureBackendAndPoll() {
-        getJSON(path: "/api/health") { [weak self] result in
-            guard let self else { return }
-            DispatchQueue.main.async {
-                switch result {
-                case .success:
-                    self.lastError = ""
-                    self.beginPolling()
-                case .failure:
-                    self.launchBackendIfAvailable()
-                    self.schedulePoll(after: 1.5)
-                }
-            }
-        }
+    @objc private func openRelay() {
+        closePopover()
+        showWindow()
     }
 
-    private func launchBackendIfAvailable() {
-        guard backend == nil, let path = backendPath else {
-            if backendPath == nil { lastError = "Backend path missing from app bundle" }
-            return
-        }
-        let executable = path.appendingPathComponent(".venv/bin/relay")
-        guard FileManager.default.isExecutableFile(atPath: executable.path) else {
-            lastError = "Backend executable unavailable"
-            return
-        }
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = ["serve", "--port", "9778"]
-        process.currentDirectoryURL = path
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        process.terminationHandler = { [weak self] _ in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.backend = nil
-                self.lastError = "Local service stopped"
-                self.updateMenuBar()
-            }
-        }
-        do {
-            try process.run()
-            backend = process
-            lastError = "Starting local service…"
-        } catch {
-            lastError = "Could not start local service"
-        }
+    @objc private func openRepro() {
+        closePopover()
+        openSiblingApp("Repro")
     }
 
-    private func beginPolling() {
-        pollTimer?.invalidate()
-        fetchSnapshot()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.fetchSnapshot() }
+    @objc private func refreshAction() {
+        model.refreshNow()
     }
 
-    private func schedulePoll(after delay: TimeInterval) {
-        pollTimer?.invalidate()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in self?.ensureBackendAndPoll() }
+    @objc private func quitAction() {
+        NSApp.terminate(nil)
     }
-
-    private func fetchSnapshot() {
-        getJSON(path: "/api/sessions") { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                switch result {
-                case .success(let object):
-                    let wasUnavailable = !self.lastError.isEmpty
-                    self.sessions = object["sessions"] as? [[String: Any]] ?? []
-                    self.snapshotCounts = object["counts"] as? [String: Int] ?? [:]
-                    self.lastError = ""
-                    if wasUnavailable { self.webView?.load(URLRequest(url: relayBaseURL)) }
-                case .failure:
-                    self.lastError = "Local service unavailable"
-                }
-                self.updateMenuBar()
-            }
-        }
-    }
-
-    private func getJSON(path: String, completion: @escaping (Result<[String: Any], Error>) -> Void) {
-        var request = URLRequest(url: relayBaseURL.appendingPathComponent(path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))))
-        request.timeoutInterval = 2.5
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            if let error { completion(.failure(error)); return }
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-                  let data, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                completion(.failure(NSError(domain: "Relay", code: 1)))
-                return
-            }
-            completion(.success(object))
-        }.resume()
-    }
-
-    private func updateMenuBar() {
-        let attention = sessions.filter { status(of: $0) == "waiting" || status(of: $0) == "failed" }.count
-        statusItem.button?.title = "R • \(sessions.count)"
-        statusItem.button?.toolTip = attention > 0 ? "Relay · \(sessions.count) sessions · \(attention) need attention" : "Relay · \(sessions.count) sessions"
-    }
-
-    private func status(of session: [String: Any]) -> String {
-        let value = (session["status"] as? String ?? "unknown").lowercased()
-        return ["running", "waiting", "completed", "failed", "interrupted", "stale", "unknown"].contains(value) ? value : "unknown"
-    }
-
-    private func timestamp(of session: [String: Any]) -> Date {
-        guard let value = session["last_event_at"] as? String else { return .distantPast }
-        let formatter = ISO8601DateFormatter()
-        if let date = formatter.date(from: value) { return date }
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: value) ?? .distantPast
-    }
-
-    private func clean(_ value: String, limit: Int) -> String {
-        let sanitized = value.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }.map(String.init).joined()
-        return String(sanitized.prefix(limit))
-    }
-
-    @objc private func openDashboard(_ sender: Any?) { showDashboard() }
-    @objc private func refreshNow(_ sender: Any?) { fetchSnapshot() }
-    @objc private func openSession(_ sender: NSMenuItem) { showDashboard() }
-    @objc private func quit(_ sender: Any?) { NSApp.terminate(nil) }
 }
 
-extension NSMenuItem {
-    @discardableResult
-    func also(_ configure: (NSMenuItem) -> Void) -> NSMenuItem {
-        configure(self)
-        return self
+struct PopoverActions {
+    let openWorkspace: () -> Void
+    let openSession: (String) -> Void
+    let openRepro: () -> Void
+    let quit: () -> Void
+}
+
+// Menu bar popover content. It sits on the system glass from nativeGlassHost, so it avoids opaque list backgrounds.
+struct RelayPopoverView: View {
+    @ObservedObject var model: SessionModel
+    let actions: PopoverActions
+
+    private var connection: (label: String, color: Color) {
+        if model.demo { return ("Synthetic demo", .indigo) }
+        if model.snapshot == nil { return model.errorMessage == nil ? ("Connecting", .gray) : ("Offline", .red) }
+        return model.errorMessage == nil ? ("Live", .green) : ("Stale", .orange)
+    }
+
+    var body: some View {
+        VStack(spacing: 12) {
+            header
+            demoToggle
+            summaryPills
+            if model.snapshot != nil, let message = model.errorMessage {
+                errorBanner(message)
+            }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    if model.snapshot == nil {
+                        unavailableState
+                    } else {
+                        if !model.attentionSessions.isEmpty { attentionSection }
+                        tasksSection
+                        providerSection
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.bottom, 2)
+            }
+            footer
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "square.stack.3d.up.fill")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.cyan)
+                .frame(width: 30, height: 30)
+                .fineCard(cornerRadius: 9)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Relay").font(.headline)
+                HStack(spacing: 5) {
+                    Circle().fill(connection.color).frame(width: 7, height: 7)
+                    Text(connection.label).font(.caption).foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Connection: \(connection.label)")
+            }
+            Spacer(minLength: 8)
+            Button { model.refreshNow() } label: {
+                Image(systemName: "arrow.clockwise")
+            }
+            .buttonStyle(.borderless)
+            .help("Refresh sessions")
+            .accessibilityLabel("Refresh sessions")
+            Menu {
+                Button("Open Relay Workspace", action: actions.openWorkspace)
+                Button("Open Repro", action: actions.openRepro)
+                Divider()
+                Button("Quit Relay", action: actions.quit)
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("More actions")
+            .accessibilityLabel("More actions")
+        }
+    }
+
+    private var demoToggle: some View {
+        HStack(spacing: 8) {
+            Toggle("Synthetic demo data", isOn: Binding(get: { model.demo }, set: { model.setDemo($0) }))
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .tint(.indigo)
+                .help("Show generated sample sessions instead of your real sessions")
+            if model.demo {
+                Text("SAMPLE")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.indigo)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(Color.indigo.opacity(0.15)))
+            }
+            Spacer()
+        }
+        .font(.caption)
+    }
+
+    private var summaryPills: some View {
+        HStack(spacing: 8) {
+            pill("Running", model.runningSessions.count, "play.circle.fill", .green)
+            pill("Waiting", model.waitingSessions.count, "hourglass", .orange)
+            pill("Failed", model.failedSessions.count, "xmark.octagon.fill", .red)
+        }
+    }
+
+    private func pill(_ title: String, _ count: Int, _ symbol: String, _ color: Color) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: symbol).foregroundStyle(color)
+            Text(title).foregroundStyle(.secondary)
+            Text("\(count)").fontWeight(.semibold).monospacedDigit()
+        }
+        .font(.caption)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 6)
+        .background(Capsule().fill(color.opacity(0.12)))
+        .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 0.5))
+        .accessibilityElement(children: .combine)
+    }
+
+    private func errorBanner(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            Text(message)
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Retry") { model.refreshNow() }
+                .controlSize(.small)
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.orange.opacity(0.12)))
+    }
+
+    @ViewBuilder private var unavailableState: some View {
+        if model.loading {
+            ProgressView("Connecting to Relay…")
+                .controlSize(.small)
+                .frame(maxWidth: .infinity)
+                .padding(.top, 40)
+        } else {
+            VStack(spacing: 8) {
+                Image(systemName: "bolt.horizontal.circle")
+                    .font(.title2)
+                    .foregroundStyle(.secondary)
+                Text("Relay engine unavailable").font(.headline)
+                Text(model.errorMessage ?? "Relay has not responded yet.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                Button("Retry") { model.refreshNow() }
+                    .buttonStyle(.bordered)
+                    .tint(.cyan)
+                    .controlSize(.small)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(16)
+            .fineCard()
+        }
+    }
+
+    private var attentionSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("NEEDS ATTENTION", count: model.attentionSessions.count)
+            ForEach(Array(model.attentionSessions.prefix(3)), id: \.key) { session in
+                TaskCard(session: session, onOpen: { actions.openSession(session.key) })
+            }
+        }
+    }
+
+    private var tasksSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("CURRENT & RECENT WORK", count: model.activeTasks.count)
+            if model.sessions.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "tray").font(.title3).foregroundStyle(.secondary)
+                    Text("No sessions yet").font(.subheadline.weight(.semibold))
+                    Text("Claude Code and Codex sessions appear here once discovered.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(16)
+                .fineCard()
+            } else {
+                ForEach(model.activeTasks, id: \.key) { session in
+                    TaskCard(session: session, onOpen: { actions.openSession(session.key) })
+                }
+            }
+        }
+    }
+
+    private var providerSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("PROVIDERS", count: nil)
+            if model.providers.isEmpty {
+                Text("No provider data").font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(model.providers) { provider in
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 7) {
+                        Circle().fill(statusColor(provider.status)).frame(width: 7, height: 7)
+                        Text(provider.id.capitalized).font(.caption.weight(.medium))
+                        Spacer()
+                        Text(provider.status.capitalized).font(.caption).foregroundStyle(.secondary)
+                    }
+                    if let message = provider.message {
+                        Text(message)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .textSelection(.enabled)
+                    }
+                }
+                .padding(10)
+                .fineCard()
+            }
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 8) {
+            Button(action: actions.openWorkspace) {
+                Label("Workspace", systemImage: "rectangle.split.2x1")
+            }
+            Button(action: actions.openRepro) {
+                Label("Open Repro", systemImage: "wrench.and.screwdriver")
+            }
+            Spacer()
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .tint(.cyan)
+    }
+
+    private func sectionHeader(_ title: String, count: Int?) -> some View {
+        HStack {
+            Text(title)
+                .font(.caption2.weight(.semibold))
+                .tracking(0.8)
+                .foregroundStyle(.secondary)
+            Spacer()
+            if let count {
+                Text("\(count)").font(.caption2).foregroundStyle(.tertiary).monospacedDigit()
+            }
+        }
+    }
+}
+
+struct TaskCard: View {
+    let session: RelaySession
+    let onOpen: () -> Void
+
+    private var summary: String { session.task.isEmpty ? session.title : session.task }
+
+    var body: some View {
+        Button(action: onOpen) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: session.provider.lowercased().contains("claude") ? "sparkle" : "terminal")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.cyan)
+                    .frame(width: 26, height: 26)
+                    .background(Circle().fill(Color.cyan.opacity(0.12)))
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(session.name)
+                            .font(.system(size: 13, weight: .semibold))
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
+                        StatusChip(status: session.status)
+                    }
+                    Text(summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                    HStack(spacing: 5) {
+                        Text(providerLabel(session))
+                        Text("·")
+                        Text(session.project).lineLimit(1).truncationMode(.middle)
+                        Spacer(minLength: 4)
+                        Text(session.last_activity).lineLimit(1)
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(10)
+            .fineCard()
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help("Show in the Relay workspace")
+        .accessibilityLabel("\(session.name), \(providerLabel(session)), \(session.status)")
+    }
+}
+
+struct StatusChip: View {
+    let status: String
+
+    var body: some View {
+        Text(status.capitalized)
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(statusColor(status))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(statusColor(status).opacity(0.14)))
+    }
+}
+
+// Subtle white-opacity surface and hairline border for small cards on top of the glass.
+extension View {
+    func fineCard(cornerRadius: CGFloat = 12) -> some View {
+        background(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous).fill(Color.white.opacity(0.06)))
+            .overlay(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 0.5))
+    }
+}
+
+struct RootView: View {
+    @ObservedObject var model: SessionModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if let message = model.errorMessage {
+                ErrorBanner(message: message) { model.refreshNow() }
+            }
+            NavigationSplitView {
+                SidebarView(model: model)
+            } content: {
+                SessionListView(model: model)
+            } detail: {
+                InspectorView(model: model)
+            }
+        }
+        .frame(minWidth: 960, minHeight: 620)
+    }
+}
+
+struct ErrorBanner: View {
+    let message: String
+    let retry: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            Text(message).lineLimit(2).textSelection(.enabled)
+            Spacer()
+            Button("Retry", action: retry)
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.12))
+    }
+}
+
+struct EmptyStateView: View {
+    let symbol: String
+    let title: String
+    let detail: String
+    var actionTitle: String?
+    var action: (() -> Void)?
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: symbol)
+                .font(.largeTitle)
+                .foregroundStyle(.secondary)
+            Text(title).font(.headline)
+            Text(detail)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 260)
+            if let actionTitle, let action {
+                Button(actionTitle, action: action)
+                    .padding(.top, 4)
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+struct SidebarView: View {
+    @ObservedObject var model: SessionModel
+
+    var body: some View {
+        List {
+            Section("Filters") {
+                Picker("Provider", selection: $model.providerFilter) {
+                    Text("All Providers").tag("all")
+                    ForEach(model.providerOptions, id: \.self) { Text($0.capitalized).tag($0) }
+                }
+                Picker("Status", selection: $model.statusFilter) {
+                    Text("All Statuses").tag("all")
+                    ForEach(model.statusOptions, id: \.self) { Text($0.capitalized).tag($0) }
+                }
+                Toggle("Demo Data", isOn: Binding(get: { model.demo }, set: { model.setDemo($0) }))
+                    .help("Replace live sessions with demo sessions")
+            }
+
+            Section("Providers") {
+                if model.providers.isEmpty {
+                    Text("No provider data").foregroundStyle(.secondary)
+                }
+                ForEach(model.providers) { provider in
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 8) {
+                            Circle().fill(statusColor(provider.status)).frame(width: 8, height: 8)
+                            Text(provider.id.capitalized).fontWeight(.medium)
+                            Spacer()
+                            Text(provider.status.capitalized).font(.caption).foregroundStyle(.secondary)
+                        }
+                        if let message = provider.message {
+                            Text(message).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                        }
+                    }
+                }
+            }
+
+            Section("Counts") {
+                if model.counts.isEmpty {
+                    Text("No counts yet").foregroundStyle(.secondary)
+                }
+                ForEach(model.counts.keys.sorted(), id: \.self) { key in
+                    HStack {
+                        Text(key.replacingOccurrences(of: "_", with: " ").capitalized)
+                        Spacer()
+                        Text("\(model.counts[key] ?? 0)").monospacedDigit()
+                    }
+                }
+            }
+
+            Section("Actions") {
+                Button { model.refreshNow() } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                Button { openSiblingApp("Repro") } label: {
+                    Label("Open Repro", systemImage: "wrench.and.screwdriver")
+                }
+            }
+        }
+        .listStyle(.sidebar)
+        .navigationTitle("Relay")
+        .navigationSplitViewColumnWidth(min: 200, ideal: 220)
+    }
+}
+
+struct SessionListView: View {
+    @ObservedObject var model: SessionModel
+
+    var body: some View {
+        Group {
+            if model.snapshot == nil && model.loading {
+                ProgressView("Loading sessions…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if model.snapshot == nil {
+                EmptyStateView(
+                    symbol: "exclamationmark.triangle",
+                    title: "Sessions unavailable",
+                    detail: model.errorMessage ?? "Relay has not loaded sessions yet.",
+                    actionTitle: "Retry",
+                    action: { model.refreshNow() }
+                )
+            } else if model.sessions.isEmpty {
+                EmptyStateView(
+                    symbol: "tray",
+                    title: "No sessions yet",
+                    detail: "Sessions from Claude Code and Codex will appear here once they are discovered."
+                )
+            } else if model.visibleSessions.isEmpty {
+                EmptyStateView(
+                    symbol: "magnifyingglass",
+                    title: "No matching sessions",
+                    detail: "Adjust the search or filters to see more sessions.",
+                    actionTitle: "Clear Filters",
+                    action: { model.clearFilters() }
+                )
+            } else {
+                List(selection: $model.selectedKey) {
+                    ForEach(model.visibleSessions, id: \.key) { session in
+                        SessionRow(session: session).tag(session.key)
+                    }
+                }
+                .listStyle(.inset)
+            }
+        }
+        .searchable(text: $model.search, prompt: "Search sessions")
+        .navigationTitle("Sessions")
+        .navigationSplitViewColumnWidth(min: 300, ideal: 380)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button { model.refreshNow() } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .help("Refresh sessions (⌘R)")
+            }
+        }
+    }
+}
+
+struct SessionRow: View {
+    let session: RelaySession
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            if session.parent_key != nil {
+                Image(systemName: "arrow.turn.down.right")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 4)
+            }
+            Circle()
+                .fill(statusColor(session.status))
+                .frame(width: 9, height: 9)
+                .padding(.top, 6)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(session.name).font(.headline).lineLimit(1)
+                    Spacer(minLength: 8)
+                    Text(session.status.capitalized)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(statusColor(session.status))
+                }
+                Text(session.task.isEmpty ? session.title : session.task)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                HStack(spacing: 6) {
+                    Text(session.provider.capitalized)
+                    Text("·")
+                    Text(session.project).lineLimit(1).truncationMode(.middle)
+                    Spacer(minLength: 8)
+                    Text(session.last_activity).lineLimit(1)
+                }
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.leading, session.parent_key == nil ? 0 : 16)
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+struct InspectorView: View {
+    @ObservedObject var model: SessionModel
+
+    var body: some View {
+        Group {
+            if let session = model.selectedSession {
+                // Keyed by session so the draft alias resets when the selection changes.
+                SessionDetail(session: session, model: model).id(session.key)
+            } else {
+                EmptyStateView(
+                    symbol: "sidebar.right",
+                    title: "No session selected",
+                    detail: "Choose a session to edit its alias, copy its resume command, and review its provenance."
+                )
+            }
+        }
+        .navigationTitle("Inspector")
+        .navigationSplitViewColumnWidth(min: 300, ideal: 340)
+    }
+}
+
+struct SessionDetail: View {
+    let session: RelaySession
+    @ObservedObject var model: SessionModel
+    @State private var draft: String
+
+    init(session: RelaySession, model: SessionModel) {
+        self.session = session
+        _model = ObservedObject(wrappedValue: model)
+        _draft = State(initialValue: session.display_name ?? "")
+    }
+
+    private var isCodex: Bool { session.provider.lowercased().contains("codex") }
+    private var isClaude: Bool { session.provider.lowercased().contains("claude") }
+    private var trimmedDraft: String { draft.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var isDirty: Bool { trimmedDraft != (session.display_name ?? "") }
+
+    private var resumeCommand: String {
+        if isClaude { return "claude --resume \(shellQuoted(session.id))" }
+        if isCodex { return "codex resume \(shellQuoted(session.id))" }
+        return session.id
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                TextField("Local alias", text: $draft)
+                    .onSubmit { save() }
+                HStack {
+                    Button("Save Alias") { save() }
+                        .keyboardShortcut("s", modifiers: .command)
+                        .disabled(!isDirty || model.busy)
+                    Button("Use Suggested") { draft = session.suggested_name ?? "" }
+                        .disabled(session.suggested_name == nil || model.busy)
+                    if model.busy {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                Text("Aliases are saved locally by Relay. Saving an empty alias clears it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } header: {
+                Text("Name")
+            }
+
+            Section {
+                Button("Copy Resume Command") { copyNative(resumeCommand) }
+                Button("Copy Session ID") { copyNative(session.id) }
+                if isClaude {
+                    Button("Copy /rename Command") { copyNative("/rename \(session.name)") }
+                }
+                if isCodex {
+                    Button("Sync Name to Codex…") { confirmSync() }
+                        .disabled(model.demo || model.busy || session.name.isEmpty)
+                    Text("Manual only. Relay never syncs names automatically. Demo sessions cannot be synced.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Resume & Sync")
+            }
+
+            Section {
+                LabeledContent("Role", value: session.role)
+                LabeledContent("Model", value: session.model ?? "—")
+                LabeledContent("Status") {
+                    Text("\(session.status) · \(session.status_source)")
+                        .foregroundStyle(statusColor(session.status))
+                }
+                LabeledContent("Last activity", value: session.last_activity)
+                LabeledContent("Last event", value: session.last_event_at ?? "—")
+                LabeledContent("Tokens", value: session.tokens.map { $0.formatted() } ?? "—")
+                LabeledContent("Project", value: session.project)
+                LabeledContent("Directory", value: session.cwd)
+                LabeledContent("Parent", value: session.parent_key ?? "None")
+            } header: {
+                Text("Provenance")
+            }
+
+            Section {
+                LabeledContent("Key", value: session.key)
+                LabeledContent("Provider", value: session.provider)
+            } header: {
+                Text("Identity")
+            }
+        }
+        .formStyle(.grouped)
+        .textSelection(.enabled)
+    }
+
+    private func save() {
+        guard isDirty, !model.busy else { return }
+        let name = trimmedDraft
+        Task { await model.saveName(session, name: name) }
+    }
+
+    // Explicit confirmation is required; nothing syncs on its own.
+    private func confirmSync() {
+        let alert = NSAlert()
+        alert.messageText = "Sync name to Codex?"
+        alert.informativeText = "This writes \"\(session.name)\" to the Codex session \(session.id). Nothing else changes."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Sync Name")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let target = session
+        Task { await model.syncName(target) }
+    }
+
+    private func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
 
 let application = NSApplication.shared
-let delegate = RelayApp()
-application.delegate = delegate
+// Top-level code runs on the main thread, so the main-actor delegate is created here.
+let appDelegate = MainActor.assumeIsolated { AppDelegate() }
+application.delegate = appDelegate
+application.setActivationPolicy(.accessory)
 application.run()

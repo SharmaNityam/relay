@@ -90,6 +90,9 @@ def test_claude_expired_oauth_error_is_actionable_and_redacted(tmp_path, monkeyp
 
     class FakeProcess:
         def __init__(self, *args, **kwargs):
+            assert "--safe-mode" in args[0]
+            assert "--bare" not in args[0]  # Bare mode deliberately ignores subscription OAuth.
+            assert kwargs["cwd"] != source
             self.stdin = BytesIO()
             self.stdout = BytesIO(payload)
 

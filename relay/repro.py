@@ -203,9 +203,9 @@ def _generate(provider: str, issue: str, root: Path) -> str:
         prompt = ("Generate one pytest regression test for this issue using only the selected source. "
                   "Return Python code only. Do not edit files.\nISSUE:\n" + issue[:12000] + "\nSOURCE:\n" + context)
         try:
-            proc = subprocess.Popen([executable, "--bare", "-p", "--model", "haiku", "--output-format", "json",
+            proc = subprocess.Popen([executable, "--safe-mode", "-p", "--model", "haiku", "--output-format", "json",
                                      "--no-session-persistence", "--tools", "", "--max-turns", "1"],
-                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                                    cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         except OSError as exc:
             raise RuntimeError("Claude Code generation could not start") from exc
         output = bytearray()

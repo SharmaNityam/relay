@@ -38,7 +38,9 @@ def suggest_name(session: Session) -> str:
     # Task descriptions often begin with boilerplate; retain the first useful sentence.
     task = re.split(r"(?<=[.!?])\s+", task, maxsplit=1)[0].strip()
     if not task:
-        task = clean_text(session.title, 100)
+        title = clean_text(session.title, 100)
+        if title.casefold() not in {"untitled session", "main session", "agent session"}:
+            task = title
     parts = [p for p in (project if project and project != "Unknown project" else "",
                          role if role and role.lower() not in {"agent", "main", "user"} else "",
                          task) if p]

@@ -35,7 +35,7 @@
           <section class="session-column">
             <div class="section-title-row"><div><div class="eyebrow">YOUR WORK</div><h2>Sessions <span id="result-count" class="subtle-count"></span></h2></div><button class="icon-button" id="refresh-button" title="Refresh snapshot" aria-label="Refresh snapshot">↻</button></div>
             <div class="filterbar">
-              <label class="searchbox"><span>⌕</span><input id="search" type="search" placeholder="Search tasks, projects, IDs…" autocomplete="off"></label>
+              <label class="searchbox" aria-label="Search sessions"><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="Search tasks, projects, IDs…" autocomplete="off"></label>
               <label class="select-wrap"><span class="sr-only">Filter provider</span><select id="provider-filter"><option value="all">All providers</option><option value="codex">Codex</option><option value="claude">Claude Code</option></select><b>⌄</b></label>
               <label class="select-wrap"><span class="sr-only">Filter status</span><select id="status-filter"><option value="all">All states</option><option value="running">Running</option><option value="waiting">Waiting</option><option value="completed">Completed</option><option value="failed">Failed</option><option value="interrupted">Interrupted</option><option value="stale">Stale</option><option value="unknown">Unknown</option></select><b>⌄</b></label>
               <label class="select-wrap project-select"><span class="sr-only">Filter project</span><select id="project-filter"><option value="all">All projects</option></select><b>⌄</b></label>

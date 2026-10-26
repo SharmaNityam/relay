@@ -513,3 +513,81 @@ def test_actual_docker_timeout_removes_only_its_own_container(tmp_path, monkeypa
     remaining = repro.subprocess.run(["docker", "ps", "-aq", "--filter", f"name=^{names[0]}$"],
                                      capture_output=True, text=True, timeout=5)
     assert not remaining.stdout.strip()
+
+
+@docker_integration
+@pytest.mark.parametrize("code", [
+    "assert False\ndef test_never_collected(): pass\n",
+    "import pytest\n@pytest.fixture\ndef broken(): assert False\ndef test_fixture(broken): pass\n",
+    "def test_missing(nonexistent_fixture): pass\n",
+])
+def test_actual_docker_collection_and_fixture_failures_are_setup_errors(tmp_path, code):
+    from relay import repro
+    (tmp_path / "test_relay_regression.py").write_text(code)
+    result = repro._run_test(tmp_path)
+    assert result["outcome"] == "setup_error", result
+
+
+@docker_integration
+def test_actual_docker_caps_raw_output_and_returns_no_runner_canary(tmp_path):
+    from relay import repro
+    (tmp_path / "test_relay_regression.py").write_text(
+        "def test_failure():\n    print('RUNNER_SECRET_CANARY_' * 10000)\n    assert False\n")
+    code, output, error = repro._docker_run(tmp_path)
+    assert code == 1 and error is None
+    assert len(output.encode()) <= 65536
+    result = repro._run_test(tmp_path)
+    assert result["outcome"] == "assertion_failure"
+    assert "RUNNER_SECRET_CANARY" not in json.dumps(result)
+
+
+def test_retry_without_source_change_does_not_claim_a_verified_fix(tmp_path, monkeypatch):
+    from relay import repro
+    source = tmp_path / "repo"
+    source.mkdir()
+    (source / "app.py").write_text("VALUE = 0\n")
+    monkeypatch.setattr(repro, "_generate", lambda *args: "def test_flaky(): assert True\n")
+    outcomes = iter([(1, "AssertionError", None), (0, "1 passed", None)])
+    monkeypatch.setattr(repro, "_docker_run", lambda *args: next(outcomes))
+    manager = repro.ReproManager(tmp_path / "state")
+    try:
+        job = manager.create({"provider": "openai", "repo_path": str(source), "issue": "Value is wrong"})
+        assert wait_job(manager, job["id"])["status"] == "reproduced"
+        try:
+            manager.verify(job["id"])
+        except ValueError:
+            return
+        result = wait_job(manager, job["id"])
+        assert result["status"] != "verified"
+        assert not any("after the source fix" in event["message"] for event in result["events"])
+    finally:
+        manager._pool.shutdown(wait=True)
+
+
+def test_docker_refuses_root_before_starting_container(tmp_path, monkeypatch):
+    from relay import repro
+    monkeypatch.setattr(repro.os, "getuid", lambda: 0)
+    monkeypatch.setattr(repro.shutil, "which", lambda name: "/synthetic/docker")
+    def forbidden(*args, **kwargs):
+        pytest.fail("Root process attempted to launch a container")
+    monkeypatch.setattr(repro.subprocess, "Popen", forbidden)
+    code, output, error = repro._docker_run(tmp_path)
+    assert code is None and not output and "root" in error
+
+
+def test_retention_prunes_completed_snapshot_and_preserves_active_job(tmp_path, monkeypatch):
+    from relay import repro
+    monkeypatch.setattr(repro, "MAX_RETAINED_JOBS", 2)
+    manager = repro.ReproManager(tmp_path)
+    try:
+        active, completed = manager.root / "active", manager.root / "completed"
+        active.mkdir()
+        completed.mkdir()
+        (completed / "source.py").write_text("PRIVATE_SOURCE = 1\n")
+        manager._jobs = {"active": {"status": "running", "work": str(active)},
+                         "completed": {"status": "error", "work": str(completed)}}
+        manager._prune_jobs()
+        assert list(manager._jobs) == ["active"]
+        assert active.is_dir() and not completed.exists()
+    finally:
+        manager._pool.shutdown(wait=True)

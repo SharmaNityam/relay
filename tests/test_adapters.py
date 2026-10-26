@@ -45,6 +45,34 @@ def test_latest_request_updates_task_but_name_keeps_initial_purpose(tmp_path):
     assert "Build the API" in session.suggested_name
 
 
+def test_codex_real_rollout_user_response_shape_after_large_metadata(tmp_path):
+    home = tmp_path / "codex"
+    path = home / "sessions/2026/10/26/agent.jsonl"
+    _line(path, {"type": "session_meta", "payload": {
+        "id": "agent-thread", "cwd": "/work/service", "agent_path": "/agents/relay_adapters",
+        "parent_thread_id": "parent-thread", "padding": "x" * 70000}})
+    _line(path, {"type": "response_item", "timestamp": "2026-10-26T09:00:00Z", "payload": {
+        "type": "message", "role": "developer", "content": [{"type": "input_text", "text": "do not expose"}]}})
+    _line(path, {"type": "response_item", "timestamp": "2026-10-26T09:01:00Z", "payload": {
+        "type": "message", "role": "user", "content": [{"type": "input_text", "text": "Repair the request parser"}]}})
+    session = scan_codex(home, 10)[0]
+    assert session.task == "Repair the request parser"
+    assert session.parent_id == "parent-thread"
+    assert session.role == "relay_adapters"
+    assert "Repair the request parser" in session.suggested_name
+    assert "do not expose" not in session.task
+
+
+def test_codex_agent_path_provides_deterministic_fallback_without_placeholder_title(tmp_path):
+    home = tmp_path / "codex"
+    path = home / "sessions/2026/10/26/agent.jsonl"
+    _line(path, {"type": "session_meta", "payload": {
+        "id": "agent-thread", "cwd": "/work/service", "agent_path": "/agents/review_service"}})
+    session = scan_codex(home, 10)[0]
+    assert session.role == "review_service"
+    assert session.suggested_name == "service · review_service"
+
+
 def test_codex_read_only_database_schema_and_unsupported_fallback(tmp_path):
     home = tmp_path / "codex"
     home.mkdir()

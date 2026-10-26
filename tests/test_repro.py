@@ -79,3 +79,27 @@ def test_demo_fix_rejects_changed_test_code(tmp_path, monkeypatch):
     manager._jobs[created["id"]]["test_code"] += "\n# altered\n"
     with pytest.raises(ValueError, match="integrity"):
         manager.demo_fix(created["id"])
+
+
+def test_claude_expired_oauth_error_is_actionable_and_redacted(tmp_path, monkeypatch):
+    source = tmp_path / "repo"
+    source.mkdir()
+    (source / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    payload = (b'{"type":"result","result":"Failed to authenticate: OAuth session expired '
+               b'and could not be refreshed; private=CLAUDE_CANARY_123"}')
+
+    class FakeProcess:
+        def __init__(self, *args, **kwargs):
+            self.stdin = BytesIO()
+            self.stdout = BytesIO(payload)
+
+        def wait(self, **kwargs):
+            return 1
+
+    monkeypatch.setattr(repro.shutil, "which", lambda name: "/mock/claude")
+    monkeypatch.setattr(repro.subprocess, "Popen", FakeProcess)
+    manager = repro.ReproManager(tmp_path / "state")
+    created = manager.create({"provider": "claude", "repo_path": str(source), "issue": "Reproduce the bug"})
+    result = _wait(manager, created["id"], "error")
+    assert result["error"] == "Claude Code authentication expired. Sign in to Claude Code and retry."
+    assert "CLAUDE_CANARY_123" not in str(result)

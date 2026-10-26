@@ -1,5 +1,72 @@
 # Relay
 
-A local command center for Codex and Claude Code: meaningful session names, live activity, and Repro.
+Relay is a local command center for Codex and Claude Code sessions. It combines a native macOS menu-bar app with a dashboard for session activity, local display names, and a bounded Python/pytest reproduction workflow.
 
-Implementation in progress. See [the plan](docs/PLAN.md).
+## Requirements
+
+- Python 3.11 or newer and [uv](https://docs.astral.sh/uv/)
+- Docker Desktop or Docker Engine for every Repro test run
+- macOS with Xcode Command Line Tools for the menu-bar app
+- Claude Code installed and authenticated only when using Claude Code as a Repro test generator, or an OpenAI-compatible endpoint configured for that workflow
+
+## Run locally
+
+From the project checkout:
+
+```sh
+uv sync --extra dev
+uv run relay serve --port 9778
+```
+
+Open <http://127.0.0.1:9778>. Relay binds only to loopback. To inspect session metadata from a terminal, run `uv run relay sessions --json`.
+
+To build the isolated Repro runner image:
+
+```sh
+docker build -t relay-repro:local -f scripts/Dockerfile.repro .
+```
+
+The image contains Python 3.12 and pytest. Relay will report Docker unavailable or return a setup error if the image or Docker is unavailable; it never falls back to executing generated tests on the host.
+
+## Synthetic demo
+
+Toggle **Demo data** in the dashboard to see clearly labelled synthetic Codex and Claude session rows. In Repro, select **Deterministic demo** to run a prewritten test against Relay's bundled fixture. It uses no model. The bundled test first fails because the fixture accepts a negative quantity; the demo fix changes only the disposable fixture, then reruns the same test.
+
+## macOS menu-bar app
+
+The build expects the checkout and its `.venv` to remain at their current paths. It creates `dist/Relay.app`; the bundle stores the checkout path and launches `.venv/bin/relay serve --port 9778` with direct process arguments. The backend remains in the checkout, so this is a local developer build rather than a portable app bundle.
+
+```sh
+uv sync --extra dev
+./scripts/build-macos.sh dist/Relay.app
+open dist/Relay.app
+```
+
+The app checks for an existing local service before starting one. It stops only the backend process that it started. Use the menu-bar item to view attention items, recent sessions, open the dashboard, refresh, or quit.
+
+## Session data and names
+
+Relay reads bounded metadata from known Codex and Claude Code session locations. It does not scan credential stores, browser data, or arbitrary project files. Status is accompanied by a source label. A last event more than 120 seconds old can make an outstanding state stale; a timestamp alone does not prove that a session is running or completed. Missing or invalid evidence is shown as unknown. Token counts are reported provider metadata when available, may be partial, and are not quotas or cost estimates.
+
+Display-name changes are stored locally in Relay's state directory. Codex native title sync is an explicit separate action. Claude Code names remain local; Relay offers a `/rename …` command to copy into a Claude Code session. It never runs copied commands.
+
+## Repro and provider configuration
+
+The Repro module handles Python files and pytest. It copies eligible `.py` files into a bounded disposable workspace, sends selected source context to the chosen generator only after **Generate failing test** is clicked, then runs the generated test in Docker with network access disabled. The copy is limited to 100 files, 1 MB per file, and 2 MB total; symlinked paths are excluded. Other languages, Python dependencies, and non-Python files are outside this workflow. The original checkout is not edited.
+
+For an OpenAI-compatible generator, copy `.env.example` to `.env`, edit its values, and load it into the shell before starting Relay:
+
+```sh
+cp .env.example .env
+# Edit .env, then load its values into this shell.
+set -a
+. ./.env
+set +a
+uv run relay serve --port 9778
+```
+
+Relay reads these values from its process environment; it does not load `.env` itself. Do not commit `.env`. Monitoring sessions makes no model calls. Claude Code generation uses the installed `claude` executable; background monitoring does not invoke it.
+
+An `assertion_failure` baseline is reported as **reproduced**. This means pytest observed an assertion failure on the original snapshot; it does not establish that the test correctly captures the issue report. Review the generated test and its oracle. Collection, import, and fixture setup errors do not count as a reproduced bug. After a reproduced baseline, verify reruns the integrity-checked test on a refreshed source copy. Downloaded evidence includes the test and report, not source files or credentials.
+
+See [the architecture](docs/ARCHITECTURE.md), [the demo storyboard](docs/DEMO.md), [the local build record](docs/BUILD_LOG.md), and [the implementation plan](docs/PLAN.md).

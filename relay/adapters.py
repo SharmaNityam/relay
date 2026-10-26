@@ -8,14 +8,18 @@ import re
 import sqlite3
 import time
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
 from .contracts import Session, Snapshot
 from .naming import clean_text, suggest_name
 
-_HEAD_BYTES = 64 * 1024
+_HEAD_BYTES = 512 * 1024
 _TAIL_BYTES = 256 * 1024
+_MAX_JSONL_LINE = 256 * 1024
+_MAX_ENTRIES_PER_DIRECTORY = 512
+_MAX_JSONL_DISCOVERY = 2000
 _STALE_SECONDS = 120
 _MAX_CLAUDE_DISCOVERY = 5000
 _MAX_CLAUDE_PROJECTS = 128
@@ -79,7 +83,7 @@ def _read_bounded(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]
     def decode(chunk: bytes) -> list[dict[str, Any]]:
         output = []
         for line in chunk.splitlines():
-            if len(line) > 65536:
+            if len(line) > _MAX_JSONL_LINE:
                 continue
             try:
                 obj = json.loads(line)
@@ -104,6 +108,12 @@ def _extract_user_text(value: Any) -> str:
                     parts.append(part["text"])
         return clean_text(" ".join(parts), 400)
     return ""
+
+
+def _codex_response_user_text(payload: dict[str, Any]) -> str:
+    if payload.get("type") != "message" or payload.get("role") != "user":
+        return ""
+    return _extract_user_text(payload.get("content"))
 
 
 def _project(cwd: str) -> str:
@@ -145,6 +155,7 @@ def _safe_source_path(root: Path, candidate: Path) -> bool:
 def _codex_events(events: list[dict[str, Any]], initial: str = "") -> dict[str, Any]:
     task = initial
     status, status_source, activity, last_at = "unknown", "unknown", "No observed activity", None
+    state_at: str | None = None
     tokens = None
     model = None
     for obj in events:
@@ -159,10 +170,13 @@ def _codex_events(events: list[dict[str, Any]], initial: str = "") -> dict[str, 
             kind = payload.get("type")
             if kind == "task_started":
                 status, status_source, activity = "running", "observed_task_started", "Task started"
+                state_at = at
             elif kind in ("task_complete", "turn_complete"):
                 status, status_source, activity = "completed", "observed_task_complete", "Task completed"
+                state_at = at
             elif kind in ("turn_aborted", "task_aborted"):
                 status, status_source, activity = "interrupted", "observed_task_aborted", "Task interrupted"
+                state_at = at
             elif kind in ("token_count", "token_usage_record"):
                 info = payload.get("info") if isinstance(payload.get("info"), dict) else payload
                 usage = info.get("total_token_usage") or info.get("token_usage") or info
@@ -178,8 +192,15 @@ def _codex_events(events: list[dict[str, Any]], initial: str = "") -> dict[str, 
                 if msg:
                     task = msg
                     status, status_source, activity = "unknown", "observed_user_request", "New user request observed"
+                    state_at = at
         elif typ == "response_item":
             kind = payload.get("type")
+            if kind == "message":
+                msg = _codex_response_user_text(payload)
+                if msg:
+                    task = msg
+                    status, status_source, activity = "unknown", "observed_user_request", "New user request observed"
+                    state_at = at
             if kind in ("function_call", "custom_tool_call"):
                 # Only the function/tool name is useful activity metadata. Never inspect args.
                 name = clean_text(str(payload.get("name") or payload.get("tool_name") or "tool"), 48)
@@ -196,7 +217,7 @@ def _codex_events(events: list[dict[str, Any]], initial: str = "") -> dict[str, 
     if status == "unknown" and last_at:
         # An event timestamp alone is not evidence that work is still running.
         activity = activity if activity != "No observed activity" else "Session activity observed"
-    status, status_source = _status(status, status_source, last_at)
+    status, status_source = _status(status, status_source, state_at)
     return {"task": task, "status": status, "status_source": status_source,
             "last_event_at": last_at, "last_activity": activity, "tokens": tokens, "model": model}
 
@@ -208,7 +229,10 @@ def _session_from_codex_row(row: dict[str, Any], parents: dict[str, str]) -> Ses
     cwd = clean_text(str(row.get("cwd") or ""), 512)
     title = clean_text(str(row.get("title") or ""), 160) or "Untitled session"
     task = clean_text(str(row.get("first_user_message") or ""), 400)
-    role = clean_text(str(row.get("agent_role") or "main"), 64)
+    role_value = row.get("agent_role")
+    if not role_value and row.get("agent_path"):
+        role_value = Path(str(row["agent_path"]).rstrip("/\\")).name
+    role = clean_text(str(role_value or "main"), 64)
     parent = parents.get(session_id)
     updated = _iso(row.get("updated_at") or row.get("created_at"))
     # Archived is a UI/library flag, not evidence that the task completed.
@@ -252,10 +276,12 @@ def _db_rows(db: Path, limit: int, home: Path | None = None) -> tuple[list[Sessi
             parent_col = next((c for c in ("parent_thread_id", "thread_id", "parent_id") if c in edge_cols), None)
             row_ids = [r.get("id") for r in rows if r.get("id")]
             if child_col and parent_col and row_ids:
-                placeholders = ",".join("?" for _ in row_ids)
-                parents = {str(r[0]): str(r[1]) for r in con.execute(
-                    f"SELECT {child_col}, {parent_col} FROM thread_spawn_edges WHERE {child_col} IN ({placeholders})",
-                    row_ids)}
+                for offset in range(0, len(row_ids), 500):
+                    chunk = row_ids[offset:offset + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    parents.update({str(r[0]): str(r[1]) for r in con.execute(
+                        f"SELECT {child_col}, {parent_col} FROM thread_spawn_edges WHERE {child_col} IN ({placeholders})",
+                        chunk)})
         output: list[Session] = []
         session_root = (home or db.parent) / "sessions"
         for row in rows:
@@ -298,16 +324,17 @@ def _codex_json_files(home: Path, limit: int) -> list[Path]:
         if not root.is_dir() or not _safe_source_path(home, root):
             return []
         # Fixed-depth known directory layout (year/month/day); avoid unrestricted recursive scans.
-        for year in sorted(root.iterdir(), reverse=True):
+        for year in sorted(islice(root.iterdir(), _MAX_ENTRIES_PER_DIRECTORY), reverse=True):
             if not year.is_dir() or not _safe_source_path(home, year):
                 continue
-            for month in sorted(year.iterdir(), reverse=True):
+            for month in sorted(islice(year.iterdir(), _MAX_ENTRIES_PER_DIRECTORY), reverse=True):
                 if not month.is_dir() or not _safe_source_path(home, month):
                     continue
-                for day in sorted(month.iterdir(), reverse=True):
+                for day in sorted(islice(month.iterdir(), _MAX_ENTRIES_PER_DIRECTORY), reverse=True):
                     if not day.is_dir() or not _safe_source_path(home, day):
                         continue
-                    for path in sorted(day.glob("*.jsonl"), key=lambda p: p.lstat().st_mtime, reverse=True):
+                    paths = islice(day.glob("*.jsonl"), _MAX_JSONL_DISCOVERY)
+                    for path in sorted(paths, key=lambda p: p.lstat().st_mtime, reverse=True):
                         if path.is_file() and _safe_source_path(home, path):
                             found.append(path)
                             if len(found) >= limit:
@@ -335,14 +362,21 @@ def _codex_file(path: Path) -> tuple[Session | None, list[str]]:
                 spawn = nested.get("thread_spawn") if isinstance(nested, dict) else None
                 if isinstance(spawn, dict):
                     parent = spawn.get("parent_thread_id")
+            if not parent:
+                parent = payload.get("parent_thread_id")
         elif typ == "event_msg" and payload.get("type") == "user_message" and not task:
             task = _extract_user_text(payload.get("message") or payload.get("content"))
+        elif typ == "response_item" and not task:
+            task = _codex_response_user_text(payload)
     session_id = clean_text(str(meta.get("id") or ""), 128)
     if not session_id:
         return None, []
     state = _codex_events(events, task)
     cwd = clean_text(str(meta.get("cwd") or ""), 512)
-    role = "subagent" if parent else "main"
+    role_value = meta.get("agent_role")
+    if not role_value and meta.get("agent_path"):
+        role_value = Path(str(meta["agent_path"]).rstrip("/\\")).name
+    role = clean_text(str(role_value or ("subagent" if parent else "main")), 64)
     s = Session(provider="codex", id=session_id, title="Untitled session", task=state["task"], cwd=cwd,
                 project=_project(cwd), parent_id=clean_text(str(parent), 128) if parent else None,
                 role=role, model=state["model"], status=state["status"], status_source=state["status_source"],
@@ -402,6 +436,7 @@ def _claude_session(path: Path, parent_id: str | None = None, child_role: str | 
     initial_task = ""
     latest_task = ""
     status, source, activity, last_at = "unknown", "unknown", "No observed activity", None
+    state_at: str | None = None
     tokens = None
     seen_messages: set[str] = set()
     for obj in entries:
@@ -425,6 +460,7 @@ def _claude_session(path: Path, parent_id: str | None = None, child_role: str | 
                     initial_task = content
                 latest_task = content
                 status, source, activity = "unknown", "observed_user_request", "New user request observed"
+                state_at = at
             if typ == "assistant":
                 msgid = str(msg.get("id") or obj.get("uuid") or "")
                 if msgid and msgid not in seen_messages:
@@ -438,8 +474,10 @@ def _claude_session(path: Path, parent_id: str | None = None, child_role: str | 
                 if tool_uses:
                     activity = f"Used {tool_uses[-1][0]}"
                     status, source = "running", "observed_assistant_tool_use"
+                    state_at = at
                 elif msg.get("stop_reason") == "end_turn":
                     status, source, activity = "completed", "observed_end_turn", "Assistant turn completed"
+                    state_at = at
         if typ == "user" and isinstance(obj.get("cwd"), str) and not cwd:
             cwd = clean_text(obj["cwd"], 512)
     if parent_id and path.stem.startswith("agent-"):
@@ -447,7 +485,7 @@ def _claude_session(path: Path, parent_id: str | None = None, child_role: str | 
     elif not session_id:
         # A Claude transcript's UUID is ordinarily its filename stem; it is a known source identifier.
         session_id = path.stem
-    status, source = _status(status, source, last_at)
+    status, source = _status(status, source, state_at)
     title = "Untitled session"
     # Claude title metadata is user-visible naming metadata; keep it bounded and sanitized.
     for obj in entries:
@@ -470,15 +508,17 @@ def _claude_files(home: Path, limit: int) -> list[tuple[Path, str | None, str | 
     try:
         if not _safe_source_path(home, root):
             return []
-        projects = sorted((p for p in root.iterdir() if p.is_dir() and _safe_source_path(home, p)),
+        projects = sorted((p for p in islice(root.iterdir(), _MAX_ENTRIES_PER_DIRECTORY)
+                           if p.is_dir() and _safe_source_path(home, p)),
                           key=lambda p: p.lstat().st_mtime, reverse=True)[:_MAX_CLAUDE_PROJECTS]
         for project in projects:
-            direct = sorted(project.glob("*.jsonl"), key=lambda p: p.lstat().st_mtime, reverse=True)
+            direct = sorted(islice(project.glob("*.jsonl"), _MAX_ENTRIES_PER_DIRECTORY),
+                            key=lambda p: p.lstat().st_mtime, reverse=True)
             for path in direct[:_MAX_ITEMS_PER_PROJECT]:
                 if path.is_file() and _safe_source_path(home, path):
                     candidates.append((path, None, None))
             # One fixed subagent directory level per parent transcript.
-            parents = sorted((p for p in project.iterdir()
+            parents = sorted((p for p in islice(project.iterdir(), _MAX_ENTRIES_PER_DIRECTORY)
                               if p.is_dir() and _safe_source_path(home, p)),
                              key=lambda p: p.lstat().st_mtime, reverse=True)[:_MAX_ITEMS_PER_PROJECT]
             for parent in parents:
@@ -487,7 +527,7 @@ def _claude_files(home: Path, limit: int) -> list[tuple[Path, str | None, str | 
                 try:
                     if not subdir.is_dir() or not _safe_source_path(home, subdir):
                         continue
-                    for child in subdir.glob("agent-*.jsonl"):
+                    for child in islice(subdir.glob("agent-*.jsonl"), _MAX_ENTRIES_PER_DIRECTORY):
                         if child.is_file() and _safe_source_path(home, child):
                             candidates.append((child, parent_id, "Agent"))
                             if len(candidates) >= _MAX_CLAUDE_DISCOVERY:

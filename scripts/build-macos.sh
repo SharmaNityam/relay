@@ -3,7 +3,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-APP_DIR="$REPO_ROOT/dist/Relay.app"
+APP_DESTINATION="${1:-dist/Relay.app}"
+if [[ "$APP_DESTINATION" = /* ]]; then
+  APP_DIR="$APP_DESTINATION"
+else
+  APP_DIR="$REPO_ROOT/$APP_DESTINATION"
+fi
 CONTENTS="$APP_DIR/Contents"
 
 command -v swiftc >/dev/null 2>&1 || { echo "swiftc is required to build Relay on macOS." >&2; exit 1; }

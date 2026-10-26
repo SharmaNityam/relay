@@ -22,8 +22,37 @@ from typing import Any
 MAX_FILES, MAX_FILE, MAX_TOTAL = 100, 1_000_000, 2_000_000
 MAX_TEST = 64_000
 DOCKER_TIMEOUT = 30
+MAX_RETAINED_JOBS = 50
 _container_lock = threading.Lock()
 _active_containers: set[str] = set()
+
+
+class ClaudeAuthExpired(RuntimeError):
+    """Safe, user-actionable message for a known expired Claude OAuth session."""
+
+
+def _claude_auth_expired(raw: bytes) -> bool:
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        value = raw.decode("utf-8", "replace")
+    strings: list[str] = []
+
+    def collect(item: Any, depth: int = 0) -> None:
+        if depth > 5 or len(strings) >= 32:
+            return
+        if isinstance(item, str):
+            strings.append(item[:4096])
+        elif isinstance(item, dict):
+            for child in list(item.values())[:32]:
+                collect(child, depth + 1)
+        elif isinstance(item, list):
+            for child in item[:32]:
+                collect(child, depth + 1)
+
+    collect(value)
+    text = " ".join(strings).casefold()
+    return "failed to authenticate" in text and "oauth" in text and "session expired" in text and "could not be refreshed" in text
 
 DEMO_SOURCE = '''def discount_total(price, quantity, discount):
     """Return a discounted total."""
@@ -70,7 +99,7 @@ def _safe_summary(text: str, limit: int = 1200) -> str:
 
 def _source_fingerprint(root: Path) -> str:
     digest = hashlib.sha256()
-    files = sorted(root.rglob("*.py"))
+    files = sorted(path for path in root.rglob("*.py") if path.name != "test_relay_regression.py")
     for path in files[:MAX_FILES]:
         rel = path.relative_to(root).as_posix()
         digest.update(rel.encode("utf-8", "replace") + b"\0")
@@ -174,7 +203,7 @@ def _generate(provider: str, issue: str, root: Path) -> str:
         prompt = ("Generate one pytest regression test for this issue using only the selected source. "
                   "Return Python code only. Do not edit files.\nISSUE:\n" + issue[:12000] + "\nSOURCE:\n" + context)
         try:
-            proc = subprocess.Popen([executable, "-p", "--model", "haiku", "--output-format", "json",
+            proc = subprocess.Popen([executable, "--bare", "-p", "--model", "haiku", "--output-format", "json",
                                      "--no-session-persistence", "--tools", "", "--max-turns", "1"],
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         except OSError as exc:
@@ -203,11 +232,13 @@ def _generate(provider: str, issue: str, root: Path) -> str:
             reader.join(timeout=1)
             raise RuntimeError("Claude Code generation timed out") from exc
         reader.join(timeout=1)
-        if return_code:
-            raise RuntimeError("Claude Code generation failed")
         raw = bytes(output)
         if len(raw) > 65536:
             raise RuntimeError("Claude Code response exceeded limit")
+        if return_code and _claude_auth_expired(raw):
+            raise ClaudeAuthExpired("Claude Code authentication expired. Sign in to Claude Code and retry.")
+        if return_code:
+            raise RuntimeError("Claude Code generation failed")
         try:
             obj = json.loads(raw)
             text = obj.get("result") or obj.get("content")
@@ -240,6 +271,8 @@ def _extract_test(text: str) -> str:
 def _docker_run(work: Path) -> tuple[int | None, str, str | None]:
     if not shutil.which("docker"):
         return None, "", "Docker is unavailable; host execution is disabled"
+    if os.getuid() == 0:
+        return None, "", "Docker Repro refuses to run from a root process"
     name = "relay-repro-" + uuid.uuid4().hex[:16]
     cmd = ["docker", "run", "--rm", "--name", name, "--network=none", "--read-only",
            f"--user={os.getuid()}:{os.getgid()}", "--cap-drop=ALL", "--security-opt=no-new-privileges",
@@ -325,9 +358,22 @@ class ReproManager:
     def __init__(self, state_dir: Path):
         self.root = Path(state_dir).expanduser() / "repro"
         self.root.mkdir(parents=True, exist_ok=True)
+        # Jobs live only in memory. Remove orphaned per-job snapshots from prior service runs.
+        for child in self.root.iterdir():
+            if child.is_dir() and re.fullmatch(r"[0-9a-f]{32}", child.name):
+                shutil.rmtree(child, ignore_errors=True)
         self._lock = threading.RLock()
         self._jobs: dict[str, dict[str, Any]] = {}
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="relay-repro")
+
+    def _prune_jobs(self) -> None:
+        while len(self._jobs) >= MAX_RETAINED_JOBS:
+            evict = next((job_id for job_id, job in self._jobs.items()
+                          if job["status"] not in {"queued", "running"}), None)
+            if evict is None:
+                raise RuntimeError("Repro retention limit reached")
+            job = self._jobs.pop(evict)
+            shutil.rmtree(job.get("work", ""), ignore_errors=True)
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)
@@ -353,6 +399,7 @@ class ReproManager:
         with self._lock:
             if sum(j["status"] in {"queued", "running"} for j in self._jobs.values()) >= 5:
                 raise RuntimeError("Repro queue is full")
+            self._prune_jobs()
             job_id = uuid.uuid4().hex
             work = self.root / job_id
             work.mkdir(mode=0o700)
@@ -403,6 +450,8 @@ class ReproManager:
                     raise ValueError("repo_path is required for provider generation")
                 source_root = work / "source"
                 _copy_source(Path(repo), source_root)
+                if (source_root / "test_relay_regression.py").exists():
+                    raise ValueError("Repository uses the reserved generated-test filename")
                 job["source_root"] = str(source_root)
                 job["test_root"] = str(source_root)
                 test_code = _generate(job["provider"], job["issue"], source_root)
@@ -431,6 +480,11 @@ class ReproManager:
                 job["status"] = "error"
                 self._event(job, "error", baseline["summary"])
             job["phase"] = "complete"
+        except ClaudeAuthExpired as exc:
+            job["status"] = "error"
+            job["error"] = str(exc)
+            job["phase"] = "complete"
+            self._event(job, "error", str(exc))
         except Exception as exc:
             job["status"] = "error"
             job["error"] = str(exc)[:200] if isinstance(exc, ValueError) else type(exc).__name__
@@ -467,6 +521,14 @@ class ReproManager:
             else:
                 self._refresh(job)
             test_root = Path(job.get("test_root", job["work"]))
+            current_fingerprint = _source_fingerprint(test_root)
+            if current_fingerprint == job["source_fingerprint"]:
+                job["verification"] = {"outcome": "unchanged_source", "exit_code": None,
+                                       "summary": "Python source did not change; this pass cannot verify a fix."}
+                job["status"] = "error"
+                job["phase"] = "complete"
+                self._event(job, "verification", "Source snapshot did not change; fix not verified")
+                return
             (test_root / "test_relay_regression.py").write_text(job["test_code"], encoding="utf-8")
             result = _run_test(Path(job["work"]))
             job["verification"] = result
@@ -497,6 +559,14 @@ class ReproManager:
         with self._lock: job = self._jobs[job_id]
         work = Path(job["work"])
         (work / "app.py").write_text(DEMO_FIXED, encoding="utf-8")
+        current_fingerprint = _source_fingerprint(work)
+        if current_fingerprint == job["source_fingerprint"]:
+            job["verification"] = {"outcome": "unchanged_source", "exit_code": None,
+                                   "summary": "Python source did not change; this pass cannot verify a fix."}
+            job["status"] = "error"
+            job["phase"] = "complete"
+            self._event(job, "verification", "Demo source did not change; fix not verified")
+            return
         test_root = Path(job.get("test_root", work))
         (test_root / "test_relay_regression.py").write_text(job["test_code"], encoding="utf-8")
         result = _run_test(work)

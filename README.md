@@ -38,7 +38,7 @@ Both applications start or reconnect to their shared background engine automatic
 
 This produces movable `Relay.app` and `Repro.app` bundles containing a managed Python 3.12 runtime and pinned engine dependencies, plus ZIPs in `dist/`. They do not need the source checkout or a separate Python installation. Keep the two apps in the same folder for the cross-app buttons. The regular `build-macos.sh` command is a smaller developer build that uses the checkout; `package-macos.sh` produces the portable builds.
 
-The bundles are **ad-hoc signed, not Apple-notarized**. The tested release is Apple Silicon on macOS 27; source builds target macOS 13+. Liquid Glass uses the native system implementation on macOS 26+, with native vibrancy on earlier supported versions. Relay and Repro have each been cold-launched from a directory whose name contains spaces, using their bundled runtime.
+The bundles are **ad-hoc signed, not Apple-notarized**. The tested release is Apple Silicon on macOS 27; source builds target macOS 13+. Liquid Glass uses the native system implementation on macOS 26+, with native vibrancy on earlier supported versions. Relay and Repro have each been cold-launched from a directory whose name contains spaces, and from a moved location, using their bundled runtime.
 
 Repro still needs Docker Desktop or Docker Engine to run tests and a signed-in Claude Code installation if that generator is selected. In the native workspace, press **Prepare Runner** when no runner image is present, or **Rebuild Runner** once it is. The one-time image build needs Docker running and network access for the initial download. Monitoring sessions itself uses no model or network calls. The shared local engine stays alive when a UI closes so the other app and active runs can continue.
 
@@ -102,7 +102,7 @@ Without `RELAY_TEST_DOCKER=1`, the seven Docker-gated tests in `tests/test_adver
 
 The native check decodes the actual API responses, runs a real Docker demo baseline, verifies its unchanged test after a source change, and downloads the evidence ZIP. Native UI acceptance includes Relay popover/task selection and Repro’s full demo flow and save dialog.
 
-GitHub Actions runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml) on every push and pull request. A Linux job runs pytest and checks `relay/web/app.js` syntax. A macOS job builds `Relay.app` from source. No CI run is recorded yet; the workflow runs after the branch is pushed.
+GitHub Actions runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml) on every push and pull request. A Linux job runs pytest and checks `relay/web/app.js` syntax. A macOS job builds `Relay.app` from source. [Run 40491271383](https://github.com/SharmaNityam/relay/actions/runs/40491271383) on commit `1dc9c65` passed both jobs.
 
 ## Submission material
 

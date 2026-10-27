@@ -2,20 +2,20 @@
 
 Date: 2026-10-27. Scope: the two native macOS apps in this repository, Relay (menu-bar session monitor) and Repro (issue-to-regression-test), with their shared local Python engine. Public source: https://github.com/SharmaNityam/relay.
 
-**Status: source, docs, and packaging are ready for public source release. Native click QA on the final build is not complete.** Parts of the Repro and Relay click flows are still pending (see below), so this report does not claim full click verification or that the project is fully submission-ready. The GitHub release is created separately, after the owner's final UI status.
+**Status: source, docs, packaging, and CI are ready for public source release. Native click QA on the final build is not complete.** Parts of the Repro and Relay click flows are still pending (see below), so this report does not claim full click verification or that the project is fully submission-ready. The release candidate `v0.2.0-rc.1` is being uploaded by a separate worker and is not published yet.
 
 ## Build under test
 
 | Item | Value |
 | --- | --- |
-| Source | `codex/relay`, based on `95161d4`, plus the release commit. |
+| Source | Release commit `1dc9c65`, pushed to public `main`. Local branch `codex/relay` is based on `95161d4` and contains the same release commit. |
 | Artifacts | `dist/Relay.app` and `dist/Repro.app` from the final package run, which includes the native focus and ambiguous-action fixes. `dist/` is git-ignored and is not published. |
 | Architecture | arm64 only. |
 | OS tested | macOS 27 (Darwin 27.0.0) only. |
 | OS not tested | macOS 13 to 26. Source builds target macOS 13+, but no run on those versions is recorded. |
 | Signing | Ad-hoc. Not Apple-notarized. |
 | Engine | Bundled managed Python 3.12 runtime with pinned dependencies. The bundles do not need the checkout or a system Python. |
-| CI | `.github/workflows/ci.yml` runs on push and pull request: a Linux job (pytest, `node --check relay/web/app.js`) and a macOS job (`build-macos.sh`). It runs after the release push. |
+| CI | `.github/workflows/ci.yml` runs on push and pull request: a Linux job (pytest, `node --check relay/web/app.js`) and a macOS job (`build-macos.sh`). Run [40491271383](https://github.com/SharmaNityam/relay/actions/runs/40491271383) on `1dc9c65` passed both jobs. |
 
 ## Automated and package checks
 
@@ -27,8 +27,11 @@ Date: 2026-10-27. Scope: the two native macOS apps in this repository, Relay (me
 | `./scripts/package-macos.sh` | Both bundles built, re-signed, zipped. | Passed |
 | `codesign --verify --deep --strict` on both apps | Pass. Ad-hoc. | Passed |
 | Bundled `relay/repro.py`, `native_sync.py`, `adapters.py` vs source | Identical (`cmp`). | Passed |
+| Latest live bundled engine vs source | All modules byte-identical to source. | Passed |
+| `./scripts/check-native-client.sh` on the latest live bundled engine | Exit 0. Log: `/tmp/relay-native-qa/director-native-client.log`: 6 sessions, reproduced baseline, verified unchanged test, ZIP evidence passed. | Passed |
+| HTTP demo job | Baseline `assertion_failure`, then demo fix verified, exit 0. Error null, test hash unchanged, ZIP report consistent. The default demo verify without the fix correctly returns 400, so this run does not exercise the error-retry path. | Passed |
 | ZIP integrity (`unzip -t`) and contents | Pass. Each ZIP contains its `.app` with `Info.plist`, `MacOS/`, `Resources/<App>.icns`, the bundled runtime, and the engine. | Passed |
-| Spaced-directory cold launch | Relay and Repro each cold-launched from a directory whose name contains spaces, using the bundled runtime. | Passed (owner observation) |
+| Cold launch from a spaced directory and from a moved location | Relay and Repro each cold-launched from a directory whose name contains spaces, and from a moved path, using the bundled runtime. | Passed (owner observation) |
 | Independent review | No P1 findings. | Done |
 | `git diff --check` and secret scan of the release files | No whitespace errors. No keys, tokens, or raw user data matched. | Passed |
 
@@ -37,33 +40,35 @@ Date: 2026-10-27. Scope: the two native macOS apps in this repository, Relay (me
 | Flow | Observed result | Status |
 | --- | --- | --- |
 | Repro live generation (Claude Code, fixture) | Reproduced baseline: `assertion_failure`, exit 1. | Passed |
-| Repro verify on unchanged source | Error `unchanged_source` shown. Earlier stages kept. **Retry** button visible. | Passed for the error state. Retry click pending. |
+| Repro verify on unchanged source | Verify was clicked on unchanged source (job `QA71770a1d`). The `unchanged_source` error and **Retry** button appeared. Retry was clicked after the fix and returned VERIFIED on the same job and test. The native click was performed. An earlier note that the Retry click was not recorded was incorrect. | Passed |
 | Repro fix and verify, same job | VERIFIED, exit 0. | Passed |
 | Repro evidence ZIP | Saved through the native save dialog. The ZIP validates, and its report test hash matches the verified test. | Passed |
 | Repro sticky footer and CTA | Actual screenshot inspected at the default size. | Passed at default size. Minimum size pending. |
 | Repro quick popover | Actual screenshot inspected. | Visible state passed. Menu actions pending. |
 | Relay local alias | Saved in the native inspector and shown in the list. | Passed |
 | Relay Codex title sync (owner's fixture thread) | Explicit confirmation from the menu bar. The session index shows the new thread name. | Passed |
-| Stale success message | Seen earlier on an engine running older code. The final bundles contain the fix. | Fixed in source and bundles. Retest on the final build pending. |
+| Stale success message | Seen earlier on an engine running older code. The current live engine clears the stale error in API and test runs. This is not the earlier engine claim. Native UI retest after the backend fix is pending. | Backend fixed. Native UI retest pending. |
 
 ## Review findings: current status
 
 - **P2-1. Generate could delete staged source after an ambiguous POST failure.** Fixed in `native/Repro.swift`. An ambiguous failure (timeout, dropped connection, 5xx, unreadable reply) keeps the staged copy because the engine may have accepted the job. Only a certain rejection (4xx or connection refused) deletes it. Compiled. Runtime retest pending.
-- **P2-2. The QA engine on the diagnostic port was stale.** This was a test-environment issue, not a source bug. The final bundles contain the clear-on-retry and clear-on-pass fixes. Results from the older engine are superseded.
+- **P2-2. The QA engine on the diagnostic port was stale.** This was a test-environment issue, not a source bug. The final bundles contain the clear-on-retry and clear-on-pass fixes. Results from the older engine are superseded. The current live engine clears the stale error in API and test runs.
 - **Ambiguous Verify message.** A timeout or 5xx on Verify previously showed a raw error with no indication that the run might have started. The final focus and ambiguous-action recovery change handles this in `runAction`: it shows a warning, then polls run status with GETs only. It compiles. Runtime retest pending.
-- **Popover focus.** `togglePopover` now makes the popover's window key, matching Relay's `showPopover`. Compiled. Runtime retest pending.
+- **Popover focus.** `togglePopover` now makes the popover's window key, matching Relay's `showPopover`. Compiled. UI acceptance is blocked: native click automation reports no windows available.
 
 ## Remaining click tests (final build)
 
-Native click automation has reported no windows available repeatedly, so these need a manual pass on the final build. Log each with a date and build ID.
+Native click automation is currently blocked: it reports no windows available. The remaining tests need a manual pass on the final build. A manual workspace open has been requested from the owner and is pending. Log each with a date and build ID.
 
-1. Repro **Retry** after an unchanged-source verify failure. The same test is reused, no model call is made, and the hash is unchanged.
-2. Repro ambiguous-action recovery: the warning appears, polling settles the run, and Generate and Verify re-enable.
-3. Repro sticky footer at minimum window size.
-4. Relay and Repro minimum window size, and popover close and reopen.
-5. Quick popover menu actions.
-6. Repro full retake.
-7. Stale success message stays absent after a passing verify.
+1. Repro ambiguous-action recovery: the warning appears, polling settles the run, and Generate and Verify re-enable.
+2. Repro sticky footer at minimum window size.
+3. Relay and Repro minimum window size, and popover close and reopen.
+4. Quick popover **More** menu actions.
+5. Repro full retake.
+6. Stale success message stays absent after a passing verify, retested in the native UI after the backend fix.
+7. Final focus change UI acceptance (popover focus and the ambiguous Verify path).
+
+Done: Repro **Retry** after an unchanged-source verify failure (job `QA71770a1d`, see the native click table).
 
 ## Synthetic demo vs live fixtures
 
@@ -83,4 +88,4 @@ Native click automation has reported no windows available repeatedly, so these n
 
 ## Verdict
 
-Source, docs, package, and automated checks are complete for public source release. Native click QA on the final build is not complete. The remaining click tests above must pass before anyone calls the native flows fully verified. The release and the videos are separate steps, and the owner decides them.
+Source, docs, package, CI, and the automated checks are complete for public source release. Native click QA on the final build is not complete. The remaining click tests above must pass before anyone calls the native flows fully verified. Release candidate `v0.2.0-rc.1` is in progress and is not published. Recording scripts are ready, but the videos are not recorded. The submission form is not done.

@@ -100,13 +100,13 @@ RELAY_TEST_DOCKER=1 uv run pytest -q
 
 Without `RELAY_TEST_DOCKER=1`, the seven Docker-gated tests in `tests/test_adversarial.py` are skipped (89 passed, 7 skipped). With it set and Docker running, that file passes 63 tests.
 
-The native check decodes the actual API responses, runs a real Docker demo baseline, verifies its unchanged test after a source change, and downloads the evidence ZIP. Native click QA on the final build has passed for Repro's full workflow (live generation, Verify retry, fix-and-verify, evidence save, runner preparation, and the stale-error clearing), Repro's More and Open Workspace actions, and Relay's local alias, filter, copy, and Codex title sync. Minimum-size layout, the final Relay popover, and ambiguous-failure recovery are still pending. See [docs/qa/SUBMISSION_QA.md](docs/qa/SUBMISSION_QA.md).
+The native check decodes the actual API responses, runs a real Docker demo baseline, verifies its unchanged test after a source change, and downloads the evidence ZIP. Native click QA on the final build has passed for Repro's full workflow (live generation, Verify retry, fix-and-verify, evidence save, runner preparation, and the stale-error clearing), Repro's More and Open Workspace actions, and Relay's local alias, filter, copy, and Codex title sync. Repro's minimum-size layout also passed on the final build. Relay's minimum-size layout, the final Relay popover retake, and ambiguous-failure recovery remain open. See [docs/qa/SUBMISSION_QA.md](docs/qa/SUBMISSION_QA.md).
 
 GitHub Actions runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml) on every push and pull request. A Linux job runs pytest and checks `relay/web/app.js` syntax. A macOS job builds `Relay.app` from source. [Run 40491271383](https://github.com/SharmaNityam/relay/actions/runs/40491271383) on commit `1dc9c65` passed both jobs. The docs-only commit `b4f81b0` also passed: [run 40491800249](https://github.com/SharmaNityam/relay/actions/runs/40491800249).
 
 ## Submission material
 
-- [Release candidate v0.2.0-rc.1 (prerelease)](https://github.com/SharmaNityam/relay/releases/tag/v0.2.0-rc.1)
+- [Relay and Repro v0.2.0 (final release)](https://github.com/SharmaNityam/relay/releases/tag/v0.2.0). The earlier [v0.2.0-rc.1](https://github.com/SharmaNityam/relay/releases/tag/v0.2.0-rc.1) prerelease is kept as a historical link to it.
 - [Relay recording script](docs/VIDEO_RELAY.md)
 - [Repro recording script](docs/VIDEO_REPRO.md)
 - [Repro product entry](docs/REPRO.md)

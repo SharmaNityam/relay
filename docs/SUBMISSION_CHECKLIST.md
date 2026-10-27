@@ -2,7 +2,7 @@
 
 Work top to bottom. Current state and evidence are in [`qa/SUBMISSION_QA.md`](qa/SUBMISSION_QA.md). Last update: 2026-10-27.
 
-**Source release** (sections 1 to 4) is published as public source at https://github.com/SharmaNityam/relay, and CI passed on the release commit. **Native click QA** (section 1) has passed for the core Repro and Relay flows; minimum window-layout sign-off and a few focus and recovery checks are still pending. **The GitHub release candidate, videos, and submission form** (sections 5 to 7) are separate steps: release candidate `v0.2.0-rc.1` is published as a prerelease at https://github.com/SharmaNityam/relay/releases/tag/v0.2.0-rc.1 with both macOS ZIPs and `SHA256SUMS.txt`, the video scripts are ready but not recorded, and the form is not done.
+**Source release** (sections 1 to 4) is published as public source at https://github.com/SharmaNityam/relay, and CI passed on the release commit. **Native click QA** (section 1) has passed for the core Repro and Relay flows, and Repro's minimum-size layout passed. Relay's minimum-size layout and a few focus and recovery checks are still pending. **The GitHub release, videos, and submission form** (sections 5 to 7) are separate steps: the final release `v0.2.0` is at https://github.com/SharmaNityam/relay/releases/tag/v0.2.0 with both macOS ZIPs and `SHA256SUMS.txt`, the video scripts are ready but not recorded, and the form is not done.
 
 ## 1. Native click verification (final build)
 
@@ -15,11 +15,11 @@ Work top to bottom. Current state and evidence are in [`qa/SUBMISSION_QA.md`](qa
 - [x] Repro: More and Open Workspace from the popover both work. Open Workspace was also tested through the full flow. *2026-10-27.*
 - [x] Repro: full retake of the workflow (generate, baseline, verify, fix, retry, save). *2026-10-27.*
 - [x] Repro: sticky footer at the default window size. *Screenshot inspected 2026-10-27.*
-- [ ] Repro: sticky footer and Generate visibility or scrolling at minimum window size. *Pending owner's manual check.*
+- [x] Repro: sticky footer and Generate visibility or scrolling at minimum window size (880×600 pt content). Both panes scrolled, Generate pinned, no clipped controls. *2026-10-27, CUA screenshot of final `dist/Repro.app`.*
 - [x] Relay: local alias, filter, and copy, in the native inspector. *Prior native click run, 2026-10-27.*
 - [x] Relay: Codex title sync on the owner's own fixture thread, from the menu bar, with explicit confirmation. The session index shows the new name. *2026-10-27.*
 - [ ] Relay: final popover retake. Automated click targeting failed (no window available to automation). Not repeated; not recorded as a product failure.
-- [ ] Relay and Repro: minimum window size, and Relay popover close and reopen. *Pending owner's manual check.*
+- [ ] Relay: minimum window size, and Relay popover close and reopen. *Pending owner's manual check.*
 - [ ] Quick popover **More** menu actions for Relay. *Repro: passed 2026-10-27. Relay: pending.*
 - [x] Stale success message stays absent after a passing verify. The final native UI retake passed on 2026-10-27.
 - [ ] Final focus change UI acceptance (popover focus and the ambiguous Verify path). Automated window targeting is unavailable in this environment; a manual pass on the final build is pending.
@@ -58,6 +58,8 @@ Work top to bottom. Current state and evidence are in [`qa/SUBMISSION_QA.md`](qa
 - [x] Release candidate `v0.2.0-rc.1` is published as a prerelease: https://github.com/SharmaNityam/relay/releases/tag/v0.2.0-rc.1. `gh release view` confirms it.
 - [x] Attached `Relay-macOS-arm64.zip`, `Repro-macOS-arm64.zip`, and `SHA256SUMS.txt`. The checksums match the uploaded assets.
 - [x] Release notes state: ad-hoc signed, not notarized, arm64, tested on macOS 27 only, Docker required for Repro, Claude Code required for live generation. Release notes updated 2026-10-27 with the final native results.
+- [x] Final release `v0.2.0` (latest, not a prerelease): https://github.com/SharmaNityam/relay/releases/tag/v0.2.0. It was promoted in place from `v0.2.0-rc.1`, so the same two ZIPs and `SHA256SUMS.txt` are attached, with no re-upload. *2026-10-27.*
+- [x] Old `v0.2.0-rc.1` kept as a historical prerelease that points to `v0.2.0`, with no assets. *2026-10-27.*
 - [ ] Optional: notarize. This needs an Apple Developer account and is outside the current setup.
 
 ## 6. Videos (scripts ready, not recorded)

@@ -2,7 +2,7 @@
 
 Date: 2026-10-27. Scope: the two native macOS apps in this repository, Relay (menu-bar session monitor) and Repro (issue-to-regression-test), with their shared local Python engine. Public source: https://github.com/SharmaNityam/relay.
 
-**Status: source, docs, packaging, and CI are ready for public source release. The core Repro and Relay click flows have passed on the final build. Minimum window-layout sign-off is still pending, so this report does not claim full click verification or that the project is fully submission-ready.** The release candidate `v0.2.0-rc.1` is published as a prerelease with both macOS ZIPs and `SHA256SUMS.txt`: https://github.com/SharmaNityam/relay/releases/tag/v0.2.0-rc.1.
+**Status: source, docs, packaging, CI, and the final `v0.2.0` release are ready for public source release. The core Repro and Relay click flows have passed on the final build, and Repro's minimum-size layout passed. Relay's minimum-size layout, the final Relay popover retake, and ambiguous-failure recovery are not verified, so this report does not claim full click verification or that the project is fully submission-ready.** The final release is https://github.com/SharmaNityam/relay/releases/tag/v0.2.0. It was promoted in place from the `v0.2.0-rc.1` prerelease, with the same two macOS ZIPs and `SHA256SUMS.txt`. The old `v0.2.0-rc.1` URL remains as a historical prerelease that points to the final release.
 
 ## Build under test
 
@@ -46,13 +46,14 @@ Date: 2026-10-27. Scope: the two native macOS apps in this repository, Relay (me
 | Repro evidence ZIP | Saved through the native save dialog. The ZIP validates, and its report test hash matches the verified test. See the receipt below. | Passed |
 | Repro runner | No runner image present, Docker running. **Prepare Runner** clicked, and the runner reached **Ready**. | Passed |
 | Repro More and Open Workspace | Both work from the popover. Open Workspace was also tested through the full flow. | Passed |
-| Repro sticky footer and CTA | Actual screenshot inspected at the default size. | Passed at default size. Minimum size pending. |
+| Repro sticky footer and CTA | Actual screenshot inspected at the default size and at the minimum size (see the minimum-layout row). | Passed |
 | Repro quick popover | Actual screenshot inspected. Visible state and More menu actions passed. | Passed |
 | Relay local alias, filter, and copy | Passed in the prior native click run. Alias saved in the native inspector and shown in the list. | Passed |
 | Relay Codex title sync (owner's fixture thread) | Explicit confirmation from the menu bar. The session index shows the new thread name. | Passed |
 | Relay final popover retake | Automated click targeting failed (no window available to automation). Not repeated. This is a test-tooling limitation, not a recorded product failure. | Not repeated |
 | Stale success message | Seen earlier on an engine running older code. The current live engine clears the stale error in API and test runs. The native UI retake on the final build passed: the error cleared on the passing verify. | Passed |
-| Minimum window layout (Repro and Relay) | Automated resize drag failed (no windows available to automation). The owner's manual check is pending: whether Generate is visible and scrollable at the minimum size. | Pending |
+| Repro minimum window layout | Final `dist/Repro.app` at the minimum content size of 880×600 pt (CUA screenshot 1760×1264 px retina, 880×632 pt including the titlebar). Both the left and right panes were scrolled down 2 pages, and both scrollbars are present. Generate stayed pinned and visible. No overlap or clipped controls. Baseline assertion 1, pass 0. Timeline all accessible. | Passed |
+| Relay minimum window layout | Not verified. The earlier automated resize drag failed (`NoWindowsAvailable`), and no Relay minimum-size run is recorded. | Pending |
 
 ## Latest evidence receipt (2026-10-27)
 
@@ -78,8 +79,8 @@ The evidence ZIP is not committed. It stays outside the repository. The receipt 
 Automated window targeting is unavailable in this environment (no windows available to automation). The items below need a manual pass on the final build. Log each with a date and build ID.
 
 1. Repro ambiguous-action recovery: the warning appears, polling settles the run, and Generate and Verify re-enable. **Pending.**
-2. Repro sticky footer and Generate visibility or scrolling at minimum window size. **Pending.**
-3. Relay and Repro minimum window size, and Relay popover close and reopen. **Pending.**
+2. Repro sticky footer and Generate visibility or scrolling at minimum window size. **Passed** for Repro (2026-10-27, final `dist/Repro.app`). Relay at minimum size: **pending.**
+3. Relay minimum window size, and Relay popover close and reopen. **Pending.**
 4. Quick popover **More** menu actions. Repro: **passed** (2026-10-27). Relay: **pending.**
 5. Repro full retake. **Passed** (2026-10-27, see the native click table).
 6. Stale success message stays absent after a passing verify, retested in the native UI after the backend fix. **Passed** (2026-10-27).
@@ -97,6 +98,7 @@ Done: Repro **Retry** after an unchanged-source verify failure (job `QA71770a1d`
 
 - Ad-hoc signed and not notarized. Gatekeeper will warn on first launch.
 - Tested on Apple Silicon and macOS 27 only. The macOS 13 to 26 paths are untested.
+- The ambiguous-failure recovery path (warning, polling, no second POST) is compiled but not runtime-verified. No network fault injection was performed.
 - Repro needs Docker running for every test run. Python and pytest only.
 - Repro's Claude generator needs an authenticated Claude Code install.
 - A passing generated assertion does not prove the bug is fixed. The oracle needs human review.
@@ -105,4 +107,4 @@ Done: Repro **Retry** after an unchanged-source verify failure (job `QA71770a1d`
 
 ## Verdict
 
-Source, docs, package, CI, and the automated checks are complete for public source release. The core native flows have passed on the final build: Repro baseline, unchanged-source error and Retry, fix and verify, evidence save, runner preparation, stale-error clearing, and Repro More and Open Workspace; Relay's alias, filter, copy, and Codex sync. Native click QA is **not fully complete**: minimum window-layout sign-off, the final Relay popover retake, Repro's ambiguous-action recovery, and the focus and ambiguous Verify check remain pending. Release candidate `v0.2.0-rc.1` is published as a prerelease with both ZIPs and `SHA256SUMS.txt`. Recording scripts are ready, but the videos are not recorded. The submission form is not done.
+Source, docs, package, CI, and the automated checks are complete for public source release. The core native flows have passed on the final build: Repro baseline, unchanged-source error and Retry, fix and verify, evidence save, runner preparation, stale-error clearing, and Repro More and Open Workspace; Relay's alias, filter, copy, and Codex sync. Repro's minimum-size layout also passed on the final build. Native click QA is **not fully complete**: Relay's minimum-size layout, the final Relay popover retake, Repro's ambiguous-action recovery, and the focus and ambiguous Verify check remain open. The final release is `v0.2.0`, promoted in place from `v0.2.0-rc.1` with both ZIPs and `SHA256SUMS.txt` unchanged. Recording scripts are ready, but the videos are not recorded. The submission form is not done.

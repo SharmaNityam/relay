@@ -2,7 +2,7 @@
 
 Date: 2026-10-27. Scope: the two native macOS apps in this repository, Relay (menu-bar session monitor) and Repro (issue-to-regression-test), with their shared local Python engine. Public source: https://github.com/SharmaNityam/relay.
 
-**Status: source, docs, packaging, and CI are ready for public source release. Native click QA on the final build is not complete.** Parts of the Repro and Relay click flows are still pending (see below), so this report does not claim full click verification or that the project is fully submission-ready. The release candidate `v0.2.0-rc.1` is being uploaded by a separate worker and is not published yet.
+**Status: source, docs, packaging, and CI are ready for public source release. Native click QA on the final build is not complete.** Parts of the Repro and Relay click flows are still pending (see below), so this report does not claim full click verification or that the project is fully submission-ready. The release candidate `v0.2.0-rc.1` is published as a prerelease with both macOS ZIPs and `SHA256SUMS.txt`: https://github.com/SharmaNityam/relay/releases/tag/v0.2.0-rc.1.
 
 ## Build under test
 
@@ -15,7 +15,7 @@ Date: 2026-10-27. Scope: the two native macOS apps in this repository, Relay (me
 | OS not tested | macOS 13 to 26. Source builds target macOS 13+, but no run on those versions is recorded. |
 | Signing | Ad-hoc. Not Apple-notarized. |
 | Engine | Bundled managed Python 3.12 runtime with pinned dependencies. The bundles do not need the checkout or a system Python. |
-| CI | `.github/workflows/ci.yml` runs on push and pull request: a Linux job (pytest, `node --check relay/web/app.js`) and a macOS job (`build-macos.sh`). Run [40491271383](https://github.com/SharmaNityam/relay/actions/runs/40491271383) on `1dc9c65` passed both jobs. |
+| CI | `.github/workflows/ci.yml` runs on push and pull request: a Linux job (pytest, `node --check relay/web/app.js`) and a macOS job (`build-macos.sh`). Run [40491271383](https://github.com/SharmaNityam/relay/actions/runs/40491271383) on `1dc9c65` passed both jobs. Docs-only commit `b4f81b0`: [run 40491800249](https://github.com/SharmaNityam/relay/actions/runs/40491800249) passed. |
 
 ## Automated and package checks
 
@@ -53,7 +53,7 @@ Date: 2026-10-27. Scope: the two native macOS apps in this repository, Relay (me
 
 - **P2-1. Generate could delete staged source after an ambiguous POST failure.** Fixed in `native/Repro.swift`. An ambiguous failure (timeout, dropped connection, 5xx, unreadable reply) keeps the staged copy because the engine may have accepted the job. Only a certain rejection (4xx or connection refused) deletes it. Compiled. Runtime retest pending.
 - **P2-2. The QA engine on the diagnostic port was stale.** This was a test-environment issue, not a source bug. The final bundles contain the clear-on-retry and clear-on-pass fixes. Results from the older engine are superseded. The current live engine clears the stale error in API and test runs.
-- **Ambiguous Verify message.** A timeout or 5xx on Verify previously showed a raw error with no indication that the run might have started. The final focus and ambiguous-action recovery change handles this in `runAction`: it shows a warning, then polls run status with GETs only. It compiles. Runtime retest pending.
+- **Ambiguous Verify message.** A timeout or 5xx on Verify previously showed a raw error with no indication that the run might have started. The final focus and ambiguous-action recovery change handles this in `runAction`: it shows a warning, then polls run status with GETs only. Read back from commit `1dc9c65`: the `runAction` catch shows "Could not confirm whether the action started … Checking run status now", then calls `startPolling(reconnecting: true)` with no second POST. It is implemented and typechecked. The runtime fault-injection test was not performed.
 - **Popover focus.** `togglePopover` now makes the popover's window key, matching Relay's `showPopover`. Compiled. UI acceptance is blocked: native click automation reports no windows available.
 
 ## Remaining click tests (final build)
@@ -88,4 +88,4 @@ Done: Repro **Retry** after an unchanged-source verify failure (job `QA71770a1d`
 
 ## Verdict
 
-Source, docs, package, CI, and the automated checks are complete for public source release. Native click QA on the final build is not complete. The remaining click tests above must pass before anyone calls the native flows fully verified. Release candidate `v0.2.0-rc.1` is in progress and is not published. Recording scripts are ready, but the videos are not recorded. The submission form is not done.
+Source, docs, package, CI, and the automated checks are complete for public source release. Native click QA on the final build is not complete. The remaining click tests above must pass before anyone calls the native flows fully verified. Release candidate `v0.2.0-rc.1` is published as a prerelease with both ZIPs and `SHA256SUMS.txt`. Recording scripts are ready, but the videos are not recorded. The submission form is not done.

@@ -1,14 +1,53 @@
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from relay.adapters import collect_sessions, scan_claude, scan_codex
+from relay.adapters import _read_bounded, collect_sessions, scan_claude, scan_codex
 
 
 def _line(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as file:
         file.write(json.dumps(value) + "\n")
+
+
+def _ago(seconds: int) -> str:
+    """Timestamp relative to now; negative values are in the future."""
+    stamp = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    return stamp.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _call(name: str, at: str | None, **extra) -> dict:
+    record = {"type": "response_item", "payload": {"type": "function_call", "name": name, "status": "completed", **extra}}
+    if at is not None:
+        record["timestamp"] = at
+    return record
+
+
+def _message(role: str, channel: str | None, at: str | None) -> dict:
+    payload = {"type": "message", "role": role, "content": [{"type": "output_text", "text": "SECRET_BODY_CANARY"}]}
+    if channel:
+        payload["channel"] = channel
+    record = {"type": "response_item", "payload": payload}
+    if at is not None:
+        record["timestamp"] = at
+    return record
+
+
+def _user(text: str, at: str) -> dict:
+    return {"type": "event_msg", "timestamp": at, "payload": {"type": "user_message", "message": text}}
+
+
+def _item(item_type: str, at: str | None, **extra) -> dict:
+    record = {"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": item_type, **extra}}}
+    if at is not None:
+        record["timestamp"] = at
+    return record
+
+
+def _codex_session(home: Path, name: str):
+    return {s.id: s for s in scan_codex(home, 20)}[name]
 
 
 def test_codex_jsonl_extracts_initial_task_status_and_parent(tmp_path):
@@ -148,3 +187,140 @@ def test_local_cli_metadata_is_not_a_task_name(tmp_path):
     session = scan_claude(home, 10)[0]
     assert "Fix the cache invalidation bug" in session.suggested_name
     assert "login" not in session.suggested_name
+
+
+def test_recent_tool_call_is_running_when_task_started_is_outside_the_read_window(tmp_path):
+    home = tmp_path / "codex"
+    path = home / "sessions/2026/10/27/live.jsonl"
+    _line(path, {"type": "session_meta", "payload": {"id": "live", "cwd": "/work/api"}})
+    # Pushes task_started beyond the head window and before the tail window.
+    _line(path, {"type": "event_msg", "payload": {"type": "filler", "padding": "x" * 600_000}})
+    _line(path, {"type": "event_msg", "timestamp": _ago(300), "payload": {"type": "task_started"}})
+    _line(path, {"type": "event_msg", "payload": {"type": "filler", "padding": "y" * 400_000}})
+    _line(path, _user("Check the deploy", _ago(20)))
+    _line(path, _call("exec_command", _ago(10), arguments='{"command":"ARGS_CANARY_123"}'))
+    head, tail = _read_bounded(path)
+    assert all(obj.get("payload", {}).get("type") != "task_started" for obj in head + tail)
+    session = _codex_session(home, "live")
+    assert session.status == "running"
+    assert session.status_source == "observed_tool_call"
+    assert session.task == "Check the deploy"
+    assert session.last_activity == "Used exec_command"
+    assert "ARGS_CANARY_123" not in json.dumps(vars(session), default=str)
+
+
+def test_completed_tool_item_refreshes_running_but_never_completes_session(tmp_path):
+    home = tmp_path / "codex"
+    path = home / "sessions/2026/10/27/tool.jsonl"
+    _line(path, {"type": "session_meta", "payload": {"id": "tool", "cwd": "/work/api"}})
+    _line(path, _user("Run the tests", _ago(60)))
+    _line(path, _call("exec_command", _ago(50)))
+    _line(path, _item("CommandExecution", _ago(5), command="pytest OUTPUT_CANARY_1", aggregated_output="OUTPUT_CANARY_1"))
+    session = _codex_session(home, "tool")
+    assert session.status == "running"
+    assert session.status_source == "observed_tool_call"
+    assert session.last_activity == "Used CommandExecution"
+    assert "OUTPUT_CANARY_1" not in json.dumps(vars(session), default=str)
+
+
+def test_tool_item_without_assistant_call_does_not_start_running(tmp_path):
+    home = tmp_path / "codex"
+    path = home / "sessions/2026/10/27/item.jsonl"
+    _line(path, {"type": "session_meta", "payload": {"id": "item", "cwd": "/work/api"}})
+    _line(path, _user("Look it up", _ago(30)))
+    _line(path, _item("McpToolCall", _ago(5), name="search"))
+    session = _codex_session(home, "item")
+    assert session.status == "unknown"
+    assert session.status_source == "observed_user_request"
+    assert session.last_activity == "Used search"
+
+
+def test_final_assistant_message_completes_and_later_usage_keeps_it(tmp_path):
+    home = tmp_path / "codex"
+    path = home / "sessions/2026/10/27/final.jsonl"
+    _line(path, {"type": "session_meta", "payload": {"id": "final", "cwd": "/work/api"}})
+    _line(path, _user("Fix the parser", _ago(60)))
+    _line(path, _call("exec_command", _ago(50)))
+    _line(path, _message("assistant", "commentary", _ago(30)))
+    _line(path, _message("assistant", "final", _ago(20)))
+    _line(path, {"type": "event_msg", "timestamp": _ago(10), "payload": {
+        "type": "token_count", "info": {"total_token_usage": {"total_tokens": 77}}}})
+    session = _codex_session(home, "final")
+    assert session.status == "completed"
+    assert session.status_source == "observed_assistant_final"
+    assert session.tokens == 77
+    assert "SECRET_BODY_CANARY" not in json.dumps(vars(session), default=str)
+
+
+def test_usage_after_aborted_turn_keeps_interrupted_state(tmp_path):
+    home = tmp_path / "codex"
+    path = home / "sessions/2026/10/27/aborted.jsonl"
+    _line(path, {"type": "session_meta", "payload": {"id": "aborted", "cwd": "/work/api"}})
+    _line(path, _user("Run the migration", _ago(40)))
+    _line(path, _call("exec_command", _ago(30)))
+    _line(path, {"type": "event_msg", "timestamp": _ago(20), "payload": {"type": "turn_aborted"}})
+    _line(path, {"type": "event_msg", "timestamp": _ago(5), "payload": {
+        "type": "token_count", "info": {"total_token_usage": {"total_tokens": 5}}}})
+    session = _codex_session(home, "aborted")
+    assert session.status == "interrupted"
+    assert session.status_source == "observed_task_aborted"
+    assert session.tokens == 5
+
+
+def test_reasoning_refreshes_running_state_but_never_starts_it(tmp_path):
+    home = tmp_path / "codex"
+    progress = home / "sessions/2026/10/27/progress.jsonl"
+    _line(progress, {"type": "session_meta", "payload": {"id": "progress", "cwd": "/work/api"}})
+    _line(progress, _user("Long job", _ago(400)))
+    _line(progress, _call("exec_command", _ago(200)))
+    _line(progress, {"type": "response_item", "timestamp": _ago(5), "payload": {
+        "type": "reasoning", "encrypted_content": "REASONING_CANARY_9"}})
+    idle = home / "sessions/2026/10/27/idle.jsonl"
+    _line(idle, {"type": "session_meta", "payload": {"id": "idle", "cwd": "/work/api"}})
+    _line(idle, _user("Just thinking", _ago(30)))
+    _line(idle, {"type": "response_item", "timestamp": _ago(5), "payload": {"type": "reasoning"}})
+    refreshed = _codex_session(home, "progress")
+    assert refreshed.status == "running"
+    assert refreshed.status_source == "observed_tool_call"
+    unchanged = _codex_session(home, "idle")
+    assert unchanged.status == "unknown"
+    assert unchanged.status_source == "observed_user_request"
+    assert "REASONING_CANARY_9" not in json.dumps(vars(refreshed), default=str)
+
+
+def test_stale_missing_invalid_and_future_tool_timestamps_never_mark_running(tmp_path):
+    home = tmp_path / "codex"
+    cases = [("stale", _ago(300), "stale"), ("missing", None, "unknown"),
+             ("invalid", "soon", "unknown"), ("future", _ago(-3600), "unknown")]
+    for name, at, _ in cases:
+        path = home / "sessions/2026/10/27" / f"{name}.jsonl"
+        _line(path, {"type": "session_meta", "payload": {"id": name, "cwd": "/work/api"}})
+        _line(path, _user("Check status", _ago(30)))
+        _line(path, _call("exec_command", at))
+    result = {s.id: s for s in scan_codex(home, 20)}
+    for name, _, expected in cases:
+        assert result[name].status == expected, name
+        assert result[name].status != "running", name
+    assert result["stale"].status_source == "inferred_from_outstanding_event_age"
+    assert result["missing"].status_source == "observed_user_request"
+    assert result["future"].status_source == "observed_user_request"
+
+
+def test_tool_inputs_outputs_and_reasoning_bodies_never_appear(tmp_path):
+    home = tmp_path / "codex"
+    path = home / "sessions/2026/10/27/canary.jsonl"
+    _line(path, {"type": "session_meta", "payload": {"id": "canary", "cwd": "/work/api"}})
+    _line(path, _user("Summarize the logs", _ago(60)))
+    _line(path, _call("exec_command", _ago(50), arguments='{"command":"ARGS_CANARY_2"}'))
+    _line(path, {"type": "response_item", "timestamp": _ago(45), "payload": {
+        "type": "custom_tool_call", "name": "apply_patch", "status": "completed", "input": "INPUT_CANARY_2"}})
+    _line(path, {"type": "response_item", "timestamp": _ago(40), "payload": {
+        "type": "reasoning", "encrypted_content": "REASONING_CANARY_2"}})
+    _line(path, _item("CommandExecution", _ago(20), command="OUTPUT_CANARY_2", aggregated_output="OUTPUT_CANARY_2"))
+    _line(path, _message("assistant", "final", _ago(10)))
+    session = _codex_session(home, "canary")
+    dumped = json.dumps(vars(session), default=str)
+    for canary in ("ARGS_CANARY_2", "INPUT_CANARY_2", "REASONING_CANARY_2", "OUTPUT_CANARY_2", "SECRET_BODY_CANARY"):
+        assert canary not in dumped
+    assert session.status == "completed"
+    assert session.status_source == "observed_assistant_final"

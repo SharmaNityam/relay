@@ -27,7 +27,7 @@ enum ReproGenerator: String, CaseIterable, Identifiable {
         case .claudeCode:
             return "Claude Code writes the test. Source snippets leave this Mac only when you press Generate, and only go to Claude Code."
         case .openAICompatible:
-            return "Uses the OpenAI-compatible endpoint configured in engine settings. Source snippets leave this Mac only when you press Generate, and only go to that endpoint."
+            return "Uses the OpenAI-compatible endpoint from environment configuration. Source snippets leave this Mac only when you press Generate, and only go to that endpoint."
         case .demo:
             return "A prewritten, deterministic test with a bundled fix. No AI runs and nothing is sent to a model."
         }
@@ -46,6 +46,393 @@ private extension String {
     var reproTrimmed: String { trimmingCharacters(in: .whitespacesAndNewlines) }
 }
 
+// Text over this limit is flagged and blocks Generate. It is never cut off silently.
+let reproIssueLimit = 12000
+
+// The OpenAI-compatible generator reads these from the engine's process environment, so they must be
+// set in the shell that starts the engine.
+let reproEndpointEnvironmentHelp = "Needs RELAY_MODEL_BASE_URL and RELAY_MODEL_NAME. RELAY_MODEL_API_KEY is optional. Set them in the shell that starts the engine, then restart it."
+
+extension ReproJob {
+    // Stand-in for a job the engine acknowledged but has not described yet.
+    static func acknowledged(id: String, status: String, demo: Bool) -> ReproJob {
+        ReproJob(id: id, status: status, phase: "Waiting for the engine to report progress.", events: [], test_code: "", baseline: nil, verification: nil, error: nil, demo: demo, download_available: false)
+    }
+
+    // The same job after an action was accepted. Evidence stays until the next poll replaces it.
+    func accepted(status: String, phase: String) -> ReproJob {
+        ReproJob(id: id, status: status, phase: phase, events: events, test_code: test_code, baseline: baseline, verification: verification, error: nil, demo: demo, download_available: false)
+    }
+}
+
+// Repro talks to the engine directly so a 404 (run gone after an engine restart) can be told apart from
+// an unreachable engine. EngineClient still owns starting the engine.
+enum ReproTransportError: LocalizedError {
+    case http(status: Int, message: String)
+
+    var errorDescription: String? {
+        if case let .http(_, message) = self { return message }
+        return nil
+    }
+}
+
+private enum ReproTransport {
+    static let session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 8
+        return URLSession(configuration: config)
+    }()
+
+    static func data(_ path: String, method: String = "GET", body: [String: String]? = nil) async throws -> Data {
+        guard let url = URL(string: path, relativeTo: EngineClient.shared.base) else {
+            throw EngineError.message("Invalid engine request")
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        if let body {
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        let (data, response) = try await session.data(for: req)
+        guard let response = response as? HTTPURLResponse else { throw EngineError.message("Invalid engine response") }
+        guard (200..<300).contains(response.statusCode) else {
+            let value = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let detail = value?["detail"] as? String ?? value?["error"] as? String
+            throw ReproTransportError.http(status: response.statusCode, message: detail ?? "Engine request failed (\(response.statusCode))")
+        }
+        return data
+    }
+
+    static func decode<T: Decodable>(_ type: T.Type, _ path: String, method: String = "GET", body: [String: String]? = nil) async throws -> T {
+        let raw = try await data(path, method: method, body: body)
+        return try JSONDecoder().decode(T.self, from: raw)
+    }
+}
+
+// True when the engine no longer has the run, which happens after an engine restart.
+private func reproRunMissing(_ error: Error) -> Bool {
+    guard let transport = error as? ReproTransportError, case let .http(status, _) = transport else { return false }
+    return status == 404
+}
+
+// True only when no job can exist: the engine answered with a 4xx rejection, or the connection was refused before
+// the request was sent. Timeouts, dropped connections, 5xx answers, and unreadable replies may follow an accepted job.
+private func reproJobCertainlyNotStarted(_ error: Error) -> Bool {
+    if let transport = error as? ReproTransportError, case let .http(status, _) = transport { return (400..<500).contains(status) }
+    return (error as? URLError)?.code == .cannotConnectToHost
+}
+
+// A symlink is rejected rather than followed, so the folder the engine reads is the one the user sees.
+private func reproIsSymbolicLink(_ path: String) -> Bool {
+    guard let attributes = try? FileManager.default.attributesOfItem(atPath: path) else { return false }
+    return attributes[.type] as? FileAttributeType == .typeSymbolicLink
+}
+
+// MARK: - Source snapshot
+
+// Repro copies the Python source it tests into a private temporary folder. The engine is a separate process without
+// the folder grant the picker gave Repro, so it only reads that copy. Limits and skip rules match the engine's own
+// copy step in relay/repro.py.
+enum ReproSnapshotError: LocalizedError {
+    case message(String)
+
+    var errorDescription: String? {
+        if case let .message(text) = self { return text }
+        return nil
+    }
+}
+
+// One private copy of the selected source, plus the picker grant that makes the original readable. Dropping the last
+// reference deletes the copy and ends the grant, so a replaced or failed snapshot cleans up after itself.
+final class NativeSourceSnapshot: @unchecked Sendable {
+    private static let maxFiles = 100
+    private static let maxFileBytes = 1_000_000
+    private static let maxTotalBytes = 2_000_000
+    private static let maxEntries = 2000
+    private static let excludedNames: Set<String> = [".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"]
+
+    let originalURL: URL
+    let stagingURL: URL
+    private let holdsScope: Bool
+    // Set when the engine may have started a job from this copy. The copy then stays until the daily prune.
+    private(set) var keptForPrune = false
+
+    var sourceName: String { originalURL.lastPathComponent }
+
+    private init(originalURL: URL, stagingURL: URL, holdsScope: Bool) {
+        self.originalURL = originalURL
+        self.stagingURL = stagingURL
+        self.holdsScope = holdsScope
+    }
+
+    deinit {
+        if !keptForPrune { try? FileManager.default.removeItem(at: stagingURL) }
+        if holdsScope { originalURL.stopAccessingSecurityScopedResource() }
+    }
+
+    func keepForPrune() { keptForPrune = true }
+
+    // Freezes the folder and makes the first copy. The walk runs off the main actor so the window stays responsive.
+    static func make(from originalURL: URL, keeping current: URL?) async throws -> NativeSourceSnapshot {
+        try await Task.detached(priority: .userInitiated) {
+            let staging = try makeStagingDirectory(keeping: current)
+            let snapshot = NativeSourceSnapshot(originalURL: originalURL, stagingURL: staging, holdsScope: originalURL.startAccessingSecurityScopedResource())
+            // A failed copy releases this snapshot on the way out, and its deinit removes the partial folder.
+            try snapshot.refresh()
+            return snapshot
+        }.value
+    }
+
+    // Replaces the copy with a fresh read of the same original folder. Verify uses this so the engine's fingerprint
+    // check sees edits made since Generate. The path field is never read here.
+    func refresh() throws {
+        let fm = FileManager.default
+        do {
+            for item in try fm.contentsOfDirectory(at: stagingURL, includingPropertiesForKeys: nil, options: []) {
+                try fm.removeItem(at: item)
+            }
+        } catch {
+            throw ReproSnapshotError.message("Repro could not clear its private source copy. Try again.")
+        }
+        try copySources()
+    }
+
+    // Symbolic links are never followed or copied, and a symbolic link as the root is refused, as in the engine.
+    private func copySources() throws {
+        let fm = FileManager.default
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+        let root = try? originalURL.resourceValues(forKeys: Set(keys))
+        guard root?.isSymbolicLink != true else {
+            throw ReproSnapshotError.message("Symbolic links are not accepted. Use the real folder path instead.")
+        }
+        guard root?.isDirectory == true else {
+            throw ReproSnapshotError.message("Repro cannot open \(sourceName). Choose the folder again with Choose….")
+        }
+        var pending: [(url: URL, relative: [String])] = [(originalURL, [])]
+        var entries = 0
+        var files = 0
+        var total = 0
+        while let folder = pending.popLast() {
+            let items: [URL]
+            do {
+                items = try fm.contentsOfDirectory(at: folder.url, includingPropertiesForKeys: keys, options: [])
+            } catch {
+                throw ReproSnapshotError.message("Repro could not read a folder inside \(sourceName). Check that it is readable, then try again.")
+            }
+            for item in items {
+                entries += 1
+                guard entries <= Self.maxEntries else {
+                    throw ReproSnapshotError.message("\(sourceName) has more than \(Self.maxEntries) entries. Point Repro at the package folder instead.")
+                }
+                let name = item.lastPathComponent
+                guard !name.hasPrefix("."), !Self.excludedNames.contains(name) else { continue }
+                let values = try? item.resourceValues(forKeys: Set(keys))
+                guard values?.isSymbolicLink != true else { continue }
+                if values?.isDirectory == true {
+                    pending.append((item, folder.relative + [name]))
+                    continue
+                }
+                guard values?.isRegularFile == true, item.pathExtension == "py" else { continue }
+                // Files over the size limit are skipped, as in the engine. Too many files or bytes stop the copy.
+                let size = values?.fileSize ?? 0
+                guard size <= Self.maxFileBytes else { continue }
+                files += 1
+                total += size
+                guard files <= Self.maxFiles, total <= Self.maxTotalBytes else {
+                    throw ReproSnapshotError.message("\(sourceName) has more Python source than Repro can copy (100 files or 2 MB). Point Repro at the package folder instead.")
+                }
+                do {
+                    let directory = folder.relative.reduce(stagingURL) { $0.appendingPathComponent($1, isDirectory: true) }
+                    try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+                    try fm.copyItem(at: item, to: directory.appendingPathComponent(name))
+                } catch {
+                    throw ReproSnapshotError.message("Repro could not copy \(name). Check that it is readable, then try again.")
+                }
+            }
+        }
+        guard files > 0 else {
+            throw ReproSnapshotError.message("\(sourceName) has no Python source files Repro can copy.")
+        }
+    }
+
+    // A new folder for one copy, inside the app's temporary folder and outside Documents. Only this user can read it.
+    private static func makeStagingDirectory(keeping current: URL?) throws -> URL {
+        let fm = FileManager.default
+        let privateMode: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
+        let parent = fm.temporaryDirectory.appendingPathComponent("Repro-Sources", isDirectory: true)
+        do {
+            try fm.createDirectory(at: parent, withIntermediateDirectories: true, attributes: privateMode)
+            pruneStale(in: parent, keeping: current)
+            let directory = parent.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try fm.createDirectory(at: directory, withIntermediateDirectories: false, attributes: privateMode)
+            return directory
+        } catch {
+            throw ReproSnapshotError.message("Repro could not create a private folder for the source copy. Check free disk space, then try again.")
+        }
+    }
+
+    // Removes copies a day old or more, such as ones left behind by a crash. The copy this app still holds is kept.
+    private static func pruneStale(in parent: URL, keeping current: URL?) {
+        let fm = FileManager.default
+        let cutoff = Date().addingTimeInterval(-86_400)
+        let items = (try? fm.contentsOfDirectory(at: parent, includingPropertiesForKeys: [.contentModificationDateKey], options: [])) ?? []
+        for item in items where item.path != current?.path {
+            let modified = try? item.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+            if let modified, modified < cutoff { try? fm.removeItem(at: item) }
+        }
+    }
+}
+
+// MARK: - Test runner
+
+// The engine sets docker_available only when Docker answers and relay-repro:local exists, so it is the runner readiness.
+struct ReproHealth: Decodable {
+    let docker_available: Bool
+}
+
+enum ReproRunnerError: LocalizedError {
+    case message(String)
+
+    var errorDescription: String? {
+        if case let .message(text) = self { return text }
+        return nil
+    }
+}
+
+// Builds relay-repro:local from the fixed scripts/Dockerfile.repro. It runs only when the parent presses Prepare Runner or
+// Rebuild Runner, never at launch or Generate. The build uses Docker's cache and deletes no images. No host tests run here.
+enum ReproRunnerBuild {
+    static let imageTag = "relay-repro:local"
+    static let timeout: TimeInterval = 120
+    private static let outputLimit = 8_192
+    private static let dockerfileLimit = 16_384
+
+    // Keeps only the newest output, so a chatty build cannot grow memory. It is read to pick a message and never shown or logged.
+    private final class BoundedOutput: @unchecked Sendable {
+        private let lock = NSLock()
+        private var tail = Data()
+
+        func append(_ chunk: Data) {
+            lock.lock()
+            defer { lock.unlock() }
+            tail.append(chunk)
+            if tail.count > ReproRunnerBuild.outputLimit { tail.removeFirst(tail.count - ReproRunnerBuild.outputLimit) }
+        }
+
+        var text: String {
+            lock.lock()
+            defer { lock.unlock() }
+            return String(decoding: tail, as: UTF8.self).lowercased()
+        }
+    }
+
+    // Blocking. Call it from Task.detached so the window stays responsive. Throws a short message the UI can show.
+    static func run() throws {
+        guard let docker = dockerExecutable() else {
+            throw ReproRunnerError.message("Docker was not found. Install Docker Desktop, start it, then press Prepare Runner again.")
+        }
+        let context = try makePrivateContext(with: try dockerfileContents())
+        defer { try? FileManager.default.removeItem(at: context) }
+
+        let output = BoundedOutput()
+        let pipe = Pipe()
+        // The pipe is drained as output arrives, so a full pipe can never stall the build.
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty { handle.readabilityHandler = nil } else { output.append(chunk) }
+        }
+        let process = Process()
+        process.executableURL = docker
+        process.arguments = ["build", "--tag", imageTag, "--file", context.appendingPathComponent("Dockerfile.repro").path, context.path]
+        process.currentDirectoryURL = context
+        process.environment = buildEnvironment()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        do {
+            try process.run()
+        } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            throw ReproRunnerError.message("Docker could not start the build. Start Docker Desktop then retry.")
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning {
+            if Date() >= deadline {
+                process.terminate()
+                pipe.fileHandleForReading.readabilityHandler = nil
+                throw ReproRunnerError.message("Runner build timed out after 2 minutes. Start Docker Desktop, make sure the network is available, then retry.")
+            }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        pipe.fileHandleForReading.readabilityHandler = nil
+        guard process.terminationStatus == 0 else {
+            let text = output.text
+            if text.contains("cannot connect to the docker daemon") || text.contains("docker desktop") || text.contains("is the docker daemon running") {
+                throw ReproRunnerError.message("Start Docker Desktop then retry.")
+            }
+            throw ReproRunnerError.message("Runner build failed; retry with network available.")
+        }
+    }
+
+    // The CLI is found at fixed locations only. A GUI launch has no shell PATH, so nothing is searched.
+    static func dockerExecutable() -> URL? {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let candidates = [
+            home.appendingPathComponent(".docker/bin/docker"),
+            URL(fileURLWithPath: "/usr/local/bin/docker"),
+            URL(fileURLWithPath: "/opt/homebrew/bin/docker"),
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
+    // The Dockerfile bundled in the app first, then the repository copy for development builds.
+    private static func dockerfileContents() throws -> Data {
+        var candidates: [URL] = []
+        if let resources = Bundle.main.resourceURL {
+            candidates.append(resources.appendingPathComponent("Dockerfile.repro"))
+        }
+        if let file = Bundle.main.url(forResource: "backend-path", withExtension: "txt"),
+           let raw = try? String(contentsOf: file, encoding: .utf8) {
+            let root = URL(fileURLWithPath: raw.trimmingCharacters(in: .whitespacesAndNewlines), isDirectory: true)
+            candidates.append(root.appendingPathComponent("scripts/Dockerfile.repro"))
+        }
+        for candidate in candidates where FileManager.default.fileExists(atPath: candidate.path) {
+            guard let data = try? Data(contentsOf: candidate), data.count <= dockerfileLimit else {
+                throw ReproRunnerError.message("The runner Dockerfile could not be read. Reinstall the complete app bundle.")
+            }
+            return data
+        }
+        throw ReproRunnerError.message("The runner Dockerfile is missing from this app. Reinstall the complete app bundle.")
+    }
+
+    // A new folder holding only the Dockerfile, so the build sends Docker nothing else. The caller deletes it.
+    private static func makePrivateContext(with dockerfile: Data) throws -> URL {
+        let fm = FileManager.default
+        let context = fm.temporaryDirectory.appendingPathComponent("Repro-Runner-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try fm.createDirectory(at: context, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            try dockerfile.write(to: context.appendingPathComponent("Dockerfile.repro"), options: .atomic)
+        } catch {
+            try? fm.removeItem(at: context)
+            throw ReproRunnerError.message("Repro could not prepare the runner build folder. Check free disk space, then try again.")
+        }
+        return context
+    }
+
+    // A small environment: the PATH matches the engine's so credential helpers resolve, and only Docker settings are passed through.
+    private static func buildEnvironment() -> [String: String] {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let inherited = ProcessInfo.processInfo.environment
+        var env = [
+            "PATH": home + "/.local/bin:" + home + "/.docker/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "HOME": home,
+        ]
+        for key in ["DOCKER_CONFIG", "DOCKER_CONTEXT", "DOCKER_HOST"] {
+            if let value = inherited[key] { env[key] = value }
+        }
+        return env
+    }
+}
+
 @MainActor
 final class ReproModel: ObservableObject {
     @Published var issue = ""
@@ -56,20 +443,70 @@ final class ReproModel: ObservableObject {
     @Published private(set) var requestInFlight = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var notice: String?
+    // The frozen copy the current real job tests against. A new accepted job replaces it, which deletes the old copy.
+    @Published private(set) var snapshot: NativeSourceSnapshot?
+    @Published private(set) var preparingSource = false
+    // Whether the engine can run tests: Docker answers and relay-repro:local exists. Nil until a check succeeds, and Generate waits for true.
+    @Published private(set) var runnerReady: Bool?
+    @Published private(set) var setupBusy = false
+    @Published private(set) var setupMessage: String?
+    // The picker's URL carries the folder grant. A typed path has no grant and is used as typed.
+    private var pickedRepositoryURL: URL?
+    // The single poll loop for the tracked job. Starting a new loop cancels the previous one.
     private var pollTask: Task<Void, Never>?
 
     var isDemo: Bool { generator == .demo }
-    var isReady: Bool { engine == .ready }
-    var repoMissing: Bool { !isDemo && repoPath.reproTrimmed.isEmpty }
-    var issueMissing: Bool { !isDemo && issue.reproTrimmed.isEmpty }
-    var jobIdle: Bool { !(job?.active ?? false) && !requestInFlight }
+    var isOffline: Bool { if case .offline = engine { return true }; return false }
+    var jobActive: Bool { job?.active ?? false }
+    var jobIdle: Bool { !jobActive && !requestInFlight }
+
+    var issueCharacterCount: Int { issue.reproTrimmed.count }
+    var issueOverLimit: Bool { !isDemo && issueCharacterCount > reproIssueLimit }
+
+    // The repository path as sent to the engine: whitespace trimmed and "~" expanded.
+    var resolvedRepoPath: String { NSString(string: repoPath.reproTrimmed).expandingTildeInPath }
+
+    // The folder to copy from, frozen when Generate is pressed. The picker's URL is used only if it still matches the path field.
+    private var repositoryOriginURL: URL {
+        let typed = URL(fileURLWithPath: resolvedRepoPath).standardizedFileURL
+        if let picked = pickedRepositoryURL, picked.standardizedFileURL.path == typed.path { return picked }
+        return typed
+    }
+
+    // Why the typed repository cannot be used, or nil when it can.
+    var repoProblem: String? {
+        guard !isDemo else { return nil }
+        let path = resolvedRepoPath
+        if path.isEmpty { return "Choose or type the path to a Python repository." }
+        if reproIsSymbolicLink(path) { return "Symbolic links are not accepted. Use the real folder path instead." }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else {
+            return "No folder exists at that path. Check the spelling, or pick the folder with Choose…."
+        }
+        guard isDirectory.boolValue else { return "That path is a file. Choose the repository folder instead." }
+        return nil
+    }
+
+    var issueProblem: String? {
+        guard !isDemo else { return nil }
+        if issueCharacterCount == 0 { return "Describe the issue to generate a test." }
+        if issueOverLimit {
+            return "The issue is \(issueCharacterCount - reproIssueLimit) characters over the \(reproIssueLimit)-character limit. Shorten it; Repro never cuts text off silently."
+        }
+        return nil
+    }
 
     var generateBlockReason: String? {
-        if !isReady { return "Waiting for the local engine to start." }
-        if job?.active == true { return "A job is running. Wait for it to finish." }
-        if repoMissing { return "Choose a repository to generate a test." }
-        if issueMissing { return "Describe the issue to generate a test." }
-        return nil
+        switch engine {
+        case .starting: return "Waiting for the local engine to start."
+        case .offline: return "The local engine is offline. Use Retry Now above to reconnect."
+        case .ready: break
+        }
+        if jobActive { return "A job is running. Wait for it to finish." }
+        if setupBusy { return "Runner setup is running. Wait for it to finish." }
+        if runnerReady == nil { return "Checking the test runner." }
+        if runnerReady == false { return "The test runner is not ready. Prepare Runner in the Test runner card first." }
+        return repoProblem ?? issueProblem
     }
 
     var canGenerate: Bool { generateBlockReason == nil && !requestInFlight }
@@ -81,7 +518,56 @@ final class ReproModel: ObservableObject {
             engine = .ready
         } catch {
             engine = .offline(error.localizedDescription)
+            runnerReady = nil
+            return
         }
+        await checkRunner()
+    }
+
+    // Reads docker_available from the engine. If the engine cannot answer, readiness is unknown and the engine goes offline,
+    // so Retry Now is the way back. It is never reported as a missing runner.
+    func checkRunner() async {
+        do {
+            runnerReady = try await ReproTransport.decode(ReproHealth.self, "/api/health").docker_available
+        } catch {
+            runnerReady = nil
+            engine = .offline("Could not read the runner status. \(error.localizedDescription)")
+        }
+    }
+
+    // Check Again reconnects and reads the status. It never starts a build.
+    func checkAgain() {
+        Task { await start() }
+    }
+
+    // Prepare Runner and Rebuild Runner. Only these buttons build the image. Launch and Generate never do.
+    func buildRunner() async {
+        guard !setupBusy, !jobActive else { return }
+        setupBusy = true
+        setupMessage = "Building the runner image. The first build can take a few minutes."
+        defer { setupBusy = false }
+        do {
+            try await Task.detached(priority: .userInitiated) { try ReproRunnerBuild.run() }.value
+        } catch {
+            setupMessage = error.localizedDescription
+            return
+        }
+        setupMessage = "Runner built. Checking it now."
+        await start()
+        setupMessage = runnerReady == true
+            ? "Runner ready. Generate can run tests."
+            : "Runner built, but it is not ready yet. Check that Docker Desktop is running, then press Check Again."
+    }
+
+    // Retry Now. Without an active job this is a plain engine start. With one, it restarts the single poll
+    // loop for that same job, so Retry never creates a new run.
+    func retryEngine() {
+        guard jobActive else {
+            Task { await start() }
+            return
+        }
+        engine = .starting
+        startPolling(reconnecting: true)
     }
 
     func generate() async {
@@ -89,23 +575,48 @@ final class ReproModel: ObservableObject {
         requestInFlight = true
         errorMessage = nil
         notice = nil
-        defer { requestInFlight = false }
+        defer { requestInFlight = false; preparingSource = false }
         var body: [String: String] = ["provider": generator.rawValue]
+        // Real runs test a private copy of the folder, so the engine never needs the picker's grant. The copy is kept
+        // only if the engine accepts the job. A failure before the request is sent releases it and deletes it. A failure
+        // after the request may have started the engine's copy step, so the copy is kept until the daily prune.
+        var copy: NativeSourceSnapshot?
         if !isDemo {
-            body["repo_path"] = repoPath.reproTrimmed
+            preparingSource = true
+            do {
+                let prepared = try await NativeSourceSnapshot.make(from: repositoryOriginURL, keeping: snapshot?.stagingURL)
+                copy = prepared
+                body["repo_path"] = prepared.stagingURL.path
+            } catch {
+                errorMessage = "Could not prepare the source: \(error.localizedDescription) Check the folder, then press Generate again."
+                return
+            }
+            preparingSource = false
             body["issue"] = issue.reproTrimmed
         }
+        let acknowledgement: JobAcknowledgement
         do {
-            let acknowledgement: JobAcknowledgement = try await EngineClient.shared.request("/api/repro", method: "POST", body: body)
-            let created: ReproJob = try await EngineClient.shared.request("/api/repro/\(acknowledgement.id)")
-            adopt(created)
+            acknowledgement = try await ReproTransport.decode(JobAcknowledgement.self, "/api/repro", method: "POST", body: body)
         } catch {
-            errorMessage = error.localizedDescription
+            if reproJobCertainlyNotStarted(error) {
+                errorMessage = "Could not start the reproduction: \(error.localizedDescription) Check the engine status above, then press Generate again."
+            } else {
+                copy?.keepForPrune()
+                errorMessage = "Could not confirm whether the run started; check connection before generating again. If it did start, it may still be using the model."
+            }
+            return
         }
+        // The engine has accepted the job. Keep its ID even if the next GET fails, and let polling own it so
+        // Generate stays disabled until the job finishes.
+        job = ReproJob.acknowledged(id: acknowledgement.id, status: acknowledgement.status, demo: isDemo)
+        // The new copy replaces the previous job's copy, which is deleted when it is released. Demo runs have none.
+        snapshot = copy
+        startPolling(reconnecting: false)
     }
 
     func verify() async {
-        await runAction("verify")
+        guard jobIdle, let source = snapshot else { return }
+        await runAction("verify", refreshing: source)
     }
 
     func demoFix() async {
@@ -118,15 +629,23 @@ final class ReproModel: ObservableObject {
         panel.allowedContentTypes = [.zip]
         panel.canCreateDirectories = true
         panel.nameFieldStringValue = "repro-\(current.id).zip"
+        // Cancelling the panel returns before any state changes, so no control stays disabled.
         guard panel.runModal() == .OK, let url = panel.url else { return }
         requestInFlight = true
         defer { requestInFlight = false }
+        let archive: Data
         do {
-            let archive = try await EngineClient.shared.data("/api/repro/\(current.id)/download")
+            archive = try await ReproTransport.data("/api/repro/\(current.id)/download")
+        } catch {
+            if reproRunMissing(error) { runUnavailable() } else { errorMessage = "Could not fetch the evidence: \(error.localizedDescription) Check the engine status above, then try again." }
+            return
+        }
+        do {
             try archive.write(to: url, options: .atomic)
+            errorMessage = nil
             notice = "Saved evidence to \(url.lastPathComponent)."
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = "Could not save to \(url.path): \(error.localizedDescription) Choose a folder you can write to, then try again."
         }
     }
 
@@ -146,6 +665,7 @@ final class ReproModel: ObservableObject {
         panel.message = "Choose the root of the Python repository to reproduce against."
         if panel.runModal() == .OK, let url = panel.url {
             repoPath = url.path
+            pickedRepositoryURL = url
         }
     }
 
@@ -154,46 +674,86 @@ final class ReproModel: ObservableObject {
         notice = nil
     }
 
-    private func runAction(_ suffix: String) async {
+    private func runAction(_ suffix: String, refreshing source: NativeSourceSnapshot? = nil) async {
         guard let current = job, jobIdle else { return }
         requestInFlight = true
         errorMessage = nil
-        defer { requestInFlight = false }
+        defer { requestInFlight = false; preparingSource = false }
+        if let source {
+            // Re-read the same frozen folder so the engine's fingerprint check sees the edits made since Generate.
+            preparingSource = true
+            do {
+                try await Task.detached(priority: .userInitiated) { try source.refresh() }.value
+            } catch {
+                errorMessage = "Could not refresh the source copy: \(error.localizedDescription) Check the folder, then press Verify again."
+                return
+            }
+            preparingSource = false
+        }
         do {
-            let _: JobAcknowledgement = try await EngineClient.shared.request("/api/repro/\(current.id)/\(suffix)", method: "POST", body: [:])
-            let fresh: ReproJob = try await EngineClient.shared.request("/api/repro/\(current.id)")
+            let acknowledgement = try await ReproTransport.decode(JobAcknowledgement.self, "/api/repro/\(current.id)/\(suffix)", method: "POST", body: [:])
             guard job?.id == current.id else { return }
-            adopt(fresh)
+            // Accepted means the job is running. Poll from here, even if the first GET fails.
+            job = current.accepted(status: acknowledgement.status, phase: "Accepted \(suffix); waiting for progress.")
+            startPolling(reconnecting: false)
         } catch {
-            errorMessage = error.localizedDescription
+            if reproRunMissing(error) {
+                runUnavailable()
+            } else if reproJobCertainlyNotStarted(error) {
+                errorMessage = error.localizedDescription
+            } else {
+                // The action may have started before the connection failed. Poll the known job instead of posting again.
+                // The error stays until a fetched result replaces the job or the user dismisses it.
+                errorMessage = "Could not confirm whether the action started: \(error.localizedDescription) Checking run status now; wait for the run to finish before trying again."
+                startPolling(reconnecting: true)
+            }
         }
     }
 
-    // Replaces the visible job and owns the single poll loop for it. Any previous loop is cancelled,
-    // and responses for a job that is no longer current are ignored.
-    private func adopt(_ fresh: ReproJob) {
+    // Starts the single poll loop for the tracked job and cancels any earlier one. The first fetch runs
+    // immediately. A failed fetch moves the engine offline and backs off 1, 2, 4, then 8 seconds. A
+    // successful fetch restores ready. The loop ends when the job finishes or the engine no longer has it.
+    private func startPolling(reconnecting: Bool) {
         pollTask?.cancel()
-        pollTask = nil
-        job = fresh
-        errorMessage = nil
-        guard fresh.active else { return }
-        let id = fresh.id
+        guard let id = job?.id else { return }
         pollTask = Task { [weak self] in
+            var reconnect = reconnecting
+            var backoff: UInt64 = 1
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard let self, !Task.isCancelled, self.job?.id == id else { return }
+                guard let self, self.job?.id == id else { return }
+                var pause: UInt64 = 1
                 do {
-                    let latest: ReproJob = try await EngineClient.shared.request("/api/repro/\(id)")
-                    guard self.job?.id == id else { return }
+                    if reconnect { try await EngineClient.shared.ensureStarted() }
+                    let latest = try await ReproTransport.decode(ReproJob.self, "/api/repro/\(id)")
+                    guard !Task.isCancelled, self.job?.id == id else { return }
                     self.job = latest
-                    self.errorMessage = nil
+                    self.engine = .ready
+                    reconnect = false
+                    backoff = 1
                     if !latest.active { return }
                 } catch {
-                    guard self.job?.id == id else { return }
-                    self.errorMessage = "Lost contact with the engine. Retrying… (\(error.localizedDescription))"
+                    guard !Task.isCancelled, self.job?.id == id else { return }
+                    if reproRunMissing(error) {
+                        self.runUnavailable()
+                        return
+                    }
+                    reconnect = true
+                    pause = backoff
+                    backoff = min(backoff * 2, 8)
+                    self.engine = .offline("Lost contact with the engine: \(error.localizedDescription) Retrying in \(pause)s.")
                 }
+                try? await Task.sleep(nanoseconds: pause * 1_000_000_000)
             }
         }
+    }
+
+    // The engine no longer knows this run, usually because it restarted. Drop the run instead of polling it
+    // forever or showing a status the engine never confirmed. Generate is available again.
+    private func runUnavailable() {
+        pollTask?.cancel()
+        job = nil
+        engine = .ready
+        errorMessage = "Run unavailable after engine restart; start a new reproduction."
     }
 }
 
@@ -216,7 +776,7 @@ final class ReproAppDelegate: NSObject, NSApplicationDelegate {
         statusItem = item
         let popover = NSPopover()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 370, height: 360)
+        popover.contentSize = NSSize(width: 370, height: 400)
         let controller = NSViewController()
         controller.view = nativeGlassHost(ReproQuickView(model: model) { [weak self] in
             self?.popover?.performClose(nil)
@@ -231,16 +791,27 @@ final class ReproAppDelegate: NSObject, NSApplicationDelegate {
     @objc private func togglePopover() {
         guard let button = statusItem?.button, let popover else { return }
         if popover.isShown { popover.performClose(nil) }
-        else { popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY) }
+        else {
+            // Menu commands can arrive while another app is frontmost; activating lets the panel take focus.
+            NSApp.activate(ignoringOtherApps: true)
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            // Same as Relay: an accessory app's popover can show without becoming key, so make it key explicitly.
+            popover.contentViewController?.view.window?.makeKey()
+        }
     }
 
-    // Closing the window keeps the app in the Dock; clicking the Dock icon brings the window back.
+    // The app runs with the accessory activation policy, so it has no Dock icon. Closing the window keeps it
+    // running in the menu bar. The menu bar panel, Window > Show Workspace, or launching the app again reopens it.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag { showWindow() }
+        if window?.isVisible == true {
+            window?.makeKeyAndOrderFront(nil)
+        } else if popover?.isShown != true {
+            togglePopover()
+        }
         return true
     }
 
@@ -263,6 +834,10 @@ final class ReproAppDelegate: NSObject, NSApplicationDelegate {
         window.center()
         window.contentView = NSHostingView(rootView: ReproRootView(model: model))
         self.window = window
+    }
+
+    @objc private func showWorkspace() {
+        showWindow()
     }
 
     private func makeMainMenu() -> NSMenu {
@@ -292,6 +867,15 @@ final class ReproAppDelegate: NSObject, NSApplicationDelegate {
         let windowMenu = NSMenu(title: "Window")
         windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windowMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenu.addItem(.separator())
+        // Shift-Command-Space opens the menu bar panel from the keyboard, so it can be used without the status item.
+        let panelItem = NSMenuItem(title: "Show Menu Bar Panel", action: #selector(togglePopover), keyEquivalent: " ")
+        panelItem.keyEquivalentModifierMask = [.command, .shift]
+        panelItem.target = self
+        windowMenu.addItem(panelItem)
+        let workspaceItem = NSMenuItem(title: "Show Workspace", action: #selector(showWorkspace), keyEquivalent: "")
+        workspaceItem.target = self
+        windowMenu.addItem(workspaceItem)
         windowItem.submenu = windowMenu
 
         return mainMenu
@@ -318,17 +902,23 @@ struct ReproQuickView: View {
                 .accessibilityLabel("Repro actions")
             }
             Divider().opacity(0.5)
+            engineStatus
+            if model.runnerReady == false {
+                Label("Test runner needs setup. Open Workspace to prepare it.", systemImage: "shippingbox")
+                    .font(.caption).foregroundStyle(.orange)
+                    .lineLimit(2)
+            }
             if let job = model.job {
-                VStack(alignment: .leading, spacing: 8) {
-                    Label(job.status.capitalized, systemImage: job.status == "verified" ? "checkmark.seal.fill" : "waveform.path")
+                VStack(alignment: .leading, spacing: 6) {
+                    Label(model.isOffline ? "\(job.status.capitalized) (last known)" : job.status.capitalized, systemImage: job.status == "verified" ? "checkmark.seal.fill" : "waveform.path")
                         .font(.headline).foregroundStyle(job.status == "verified" ? .green : .indigo)
                     Text(job.demo ? "Prewritten demo test" : "Generated regression test").font(.callout)
-                    Text(job.error ?? job.phase).font(.caption).foregroundStyle(.secondary).lineLimit(3)
+                    Text(job.error ?? job.phase).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                 }
             } else {
-                Text("Turn a bug report into a failing test.")
+                Text("No reproduction yet.")
                     .font(.headline)
-                Text("Review the test, fix your source, then verify the identical test in Docker.")
+                Text("Turn a bug report into a failing test, fix your source, then verify it in Docker.")
                     .font(.callout).foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
@@ -336,11 +926,28 @@ struct ReproQuickView: View {
                 HStack { Text("Open Workspace"); Spacer(); Image(systemName: "arrow.up.right") }
                     .padding(.vertical, 8)
             }.buttonStyle(.borderedProminent).tint(.indigo)
-            Label(model.isReady ? "Local engine connected" : "Connecting to local engine", systemImage: "circle.fill")
-                .font(.caption2).foregroundStyle(.secondary)
         }
         .padding(22)
-        .frame(width: 370, height: 360)
+        .frame(width: 370, height: 400)
+    }
+
+    // Live engine state. Offline shows the reason and a Retry Now control.
+    @ViewBuilder private var engineStatus: some View {
+        switch model.engine {
+        case .starting:
+            Label("Connecting to the local engine…", systemImage: "circle.dotted")
+                .font(.caption).foregroundStyle(.secondary)
+        case .ready:
+            Label("Local engine connected", systemImage: "circle.fill")
+                .font(.caption).foregroundStyle(.green)
+        case let .offline(message):
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Local engine offline", systemImage: "bolt.horizontal.circle.fill")
+                    .font(.caption.weight(.semibold)).foregroundStyle(.red)
+                Text(message).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                Button("Retry Now") { model.retryEngine() }.controlSize(.small)
+            }
+        }
     }
 }
 
@@ -371,12 +978,16 @@ struct EngineStatusBar: View {
             HStack(spacing: 10) {
                 if model.engine == .starting {
                     ProgressView().controlSize(.small)
-                    Text("Starting the local engine…")
+                    Text(model.jobActive ? "Reconnecting to the local engine…" : "Starting the local engine…")
                 } else {
                     Image(systemName: "bolt.horizontal.circle.fill").foregroundStyle(.red)
-                    Text(offlineMessage).lineLimit(2).textSelection(.enabled)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(model.jobActive ? "Engine offline. Your job is still tracked." : "Engine offline.")
+                            .font(.callout.weight(.semibold))
+                        Text(offlineMessage).font(.caption).lineLimit(2).textSelection(.enabled)
+                    }
                     Spacer()
-                    Button("Retry") { Task { await model.start() } }
+                    Button("Retry Now") { model.retryEngine() }
                 }
             }
             .font(.callout)
@@ -416,11 +1027,90 @@ struct GeneratorPanel: View {
                 PanelCard(title: "Generator", symbol: "cpu") {
                     GeneratorChooser(model: model)
                 }
-                GenerateControls(model: model)
+                PanelCard(title: "Test runner", symbol: "shippingbox") {
+                    RunnerCard(model: model)
+                }
             }
             .padding(16)
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 0) {
+                Divider()
+                GenerateControls(model: model).padding(16)
+            }
+            .background(.bar)
+        }
+    }
+}
+
+// Runner readiness and the explicit setup actions. Generate waits for this to read ready, so no model credit is spent on a
+// run Docker cannot execute.
+struct RunnerCard: View {
+    @ObservedObject var model: ReproModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            statusLine
+            if model.runnerReady == false && !model.setupBusy {
+                Text("Docker Desktop must be running. Prepare Runner builds the bundled public Python and pytest image. The initial download requires network access.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+            }
+            HStack(spacing: 8) {
+                if model.runnerReady == true {
+                    Button {
+                        Task { await model.buildRunner() }
+                    } label: {
+                        Label("Rebuild Runner", systemImage: "hammer")
+                    }
+                    .disabled(model.setupBusy || model.jobActive)
+                } else {
+                    Button {
+                        Task { await model.buildRunner() }
+                    } label: {
+                        Label("Prepare Runner", systemImage: "shippingbox")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.indigo)
+                    .disabled(model.setupBusy || model.jobActive)
+                }
+                Button("Check Again") { model.checkAgain() }
+                    .disabled(model.setupBusy)
+            }
+            if let message = model.setupMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
+    @ViewBuilder private var statusLine: some View {
+        if model.setupBusy {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Building the runner image…").font(.callout)
+            }
+        } else {
+            switch model.runnerReady {
+            case true?:
+                Label("Ready", systemImage: "checkmark.seal.fill")
+                    .font(.callout.weight(.semibold)).foregroundStyle(.green)
+            case false?:
+                Label("Needs setup", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout.weight(.semibold)).foregroundStyle(.orange)
+            case nil:
+                Label("Checking…", systemImage: "circle.dotted")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+        }
     }
 }
 
@@ -428,18 +1118,34 @@ struct IssueEditor: View {
     @ObservedObject var model: ReproModel
 
     var body: some View {
-        TextEditor(text: $model.issue)
-            .font(.body)
-            .frame(minHeight: 150)
-            .overlay(alignment: .topLeading) {
-                if model.issue.isEmpty {
-                    Text("Describe the bug, e.g. \"checkout ignores expired discount codes\".")
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 8)
-                        .allowsHitTesting(false)
+        VStack(alignment: .leading, spacing: 6) {
+            TextEditor(text: $model.issue)
+                .font(.body)
+                .frame(height: 120)
+                .overlay(alignment: .topLeading) {
+                    if model.issue.isEmpty {
+                        Text("Describe the bug, e.g. \"checkout ignores expired discount codes\".")
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 8)
+                            .allowsHitTesting(false)
+                    }
+                }
+            if !model.isDemo {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    if model.issueOverLimit, let problem = model.issueProblem {
+                        Text(problem)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 8)
+                    Text("\(model.issueCharacterCount) of \(reproIssueLimit) characters")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(model.issueOverLimit ? Color.red : Color.secondary)
                 }
             }
+        }
     }
 }
 
@@ -449,7 +1155,7 @@ struct RepositoryField: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                TextField("Path to a Python repository", text: $model.repoPath)
+                TextField("Path to a Python repository, e.g. ~/code/app", text: $model.repoPath)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))
                     .disabled(model.isDemo)
@@ -460,9 +1166,21 @@ struct RepositoryField: View {
                 }
                 .disabled(model.isDemo)
             }
-            Text(model.isDemo ? "Demo does not use a repository." : "Python and pytest projects only. Repro reads this folder and never writes to it.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            if model.isDemo {
+                Text("Demo does not use a repository.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if let problem = model.repoProblem, !model.repoPath.reproTrimmed.isEmpty {
+                Text(problem)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Python and pytest projects only. Repro reads this folder and never writes to it. A leading ~ is expanded.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 }
@@ -486,6 +1204,12 @@ struct GeneratorChooser: View {
             Text("Docker is required. There is no host fallback.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if model.generator == .openAICompatible {
+                Text(reproEndpointEnvironmentHelp)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if model.isDemo {
                 StatusPill(text: reproDemoBadgeText, color: .purple)
             }
@@ -507,7 +1231,7 @@ struct GenerateControls: View {
                     } else {
                         Image(systemName: "wand.and.stars")
                     }
-                    Text(model.isDemo ? "Run Demo Test" : "Generate Test")
+                    Text(model.preparingSource ? "Preparing source…" : model.isDemo ? "Run Demo Test" : "Generate Test")
                 }
                 .frame(maxWidth: .infinity)
             }
@@ -586,7 +1310,7 @@ struct EmptyInspector: View {
             Image(systemName: model.requestInFlight ? "hourglass" : "flask")
                 .font(.system(size: 40))
                 .foregroundStyle(.secondary)
-            Text(model.requestInFlight ? "Starting job…" : "No reproduction yet")
+            Text(model.preparingSource ? "Preparing source…" : model.requestInFlight ? "Starting job…" : "No reproduction yet")
                 .font(.title3.weight(.semibold))
             Text("Describe the issue, choose a repository and generator, then press Generate. Progress and results appear here.")
                 .multilineTextAlignment(.center)
@@ -609,6 +1333,12 @@ struct JobDetail: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 JobHeader(job: job)
+                if !job.demo, let snapshot = model.snapshot {
+                    Text("Tested against a frozen copy of \(snapshot.sourceName), taken when you pressed Generate. Verify re-reads that folder, not the path field. Only Python files are copied.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 ProgressTimeline(job: job)
                 if let error = job.error, !error.isEmpty {
                     ErrorCard(message: error)
@@ -653,6 +1383,8 @@ struct ProgressTimeline: View {
     private var reached: Int {
         if job.status == "verified" { return 4 }
         if job.status == "reproduced" { return 2 }
+        if job.verification != nil { return 3 }
+        if job.baseline != nil { return 2 }
         let phase = job.phase.lowercased()
         if phase.contains("verif") { return 3 }
         if phase.contains("review") { return 2 }
@@ -687,6 +1419,7 @@ struct ProgressTimeline: View {
             return index == reached ? .current : .pending
         }
         if index < reached { return .done }
+        if index == reached && job.status == "error" { return .failed }
         if index == reached && job.status == "reproduced" { return .review }
         return .pending
     }
@@ -694,6 +1427,7 @@ struct ProgressTimeline: View {
 
 enum StageState: Equatable {
     case done
+    case failed
     case current
     case review
     case pending
@@ -713,6 +1447,8 @@ struct StageNode: View {
                     ProgressView().controlSize(.small)
                 case .review:
                     Image(systemName: "eye.circle.fill").foregroundStyle(.orange)
+                case .failed:
+                    Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.red)
                 case .pending:
                     Image(systemName: "circle").foregroundStyle(.secondary)
                 }
@@ -734,11 +1470,12 @@ struct ActionCard: View {
         PanelCard(title: "Next step", symbol: "checkmark.shield") {
             VStack(alignment: .leading, spacing: 10) {
                 if job.active {
-                    Text("Running. This view updates every second.")
+                    Text("Running. Progress refreshes automatically while the engine is reachable.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
-                if job.status == "reproduced" && !job.active {
+                if !job.active && (job.status == "reproduced" ||
+                    (job.status == "error" && job.baseline?.outcome == "assertion_failure")) {
                     if job.demo {
                         Text("Demo only: the prewritten test and its fix are bundled with Repro. Applying the fix verifies the demo, not your repository.")
                             .font(.callout)
@@ -762,7 +1499,7 @@ struct ActionCard: View {
                         Button {
                             Task { await model.verify() }
                         } label: {
-                            Label("Verify After Source Fix", systemImage: "checkmark.circle")
+                            Label(model.preparingSource ? "Preparing source…" : "Verify After Source Fix", systemImage: "checkmark.circle")
                         }
                         .buttonStyle(.borderedProminent)
                         .disabled(model.requestInFlight)
@@ -855,7 +1592,7 @@ struct ErrorCard: View {
             return "Repro runs Python tests with pytest. Make sure the repository has a Python environment with pytest installed."
         }
         if lower.contains("endpoint") || lower.contains("api key") || lower.contains("auth") {
-            return "Check the OpenAI-compatible endpoint and credentials in engine settings, then generate again."
+            return "Check RELAY_MODEL_BASE_URL, RELAY_MODEL_NAME and RELAY_MODEL_API_KEY in the engine's environment configuration, restart the engine, then generate again."
         }
         if lower.contains("claude") {
             return "Check that Claude Code is installed and signed in, then generate again."

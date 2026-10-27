@@ -62,7 +62,7 @@ def test_native_sync_waits_for_initialize_before_renaming(tmp_path, monkeypatch)
     fake = tmp_path / "codex"
     fake.write_text(textwrap.dedent("""\
         #!/usr/bin/env python3
-        import json, sys
+        import json, sys, threading, time
         ready = False
         for line in sys.stdin:
             message = json.loads(line)
@@ -71,11 +71,14 @@ def test_native_sync_waits_for_initialize_before_renaming(tmp_path, monkeypatch)
                 ready = True
             elif message.get('method') == 'thread/name/set':
                 assert ready
-                print(json.dumps({'id': message['id'], 'result': {'ok': True}}), flush=True)
-                break
+                # The real server replies asynchronously and shuts down on input EOF.
+                def finish(request_id=message['id']):
+                    time.sleep(0.02)
+                    print(json.dumps({'id': request_id, 'result': {'ok': True}}), flush=True)
+                threading.Thread(target=finish, daemon=True).start()
     """), encoding="utf-8")
     fake.chmod(0o755)
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
     from relay.native_sync import rename_codex
-    result = rename_codex("fixture-thread", "Fixture title")
+    result = rename_codex("fixture-thread", "Fixture title", timeout=1)
     assert result == {"ok": True, "provider": "codex", "id": "fixture-thread", "name": "Fixture title"}

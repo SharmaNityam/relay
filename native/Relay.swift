@@ -61,6 +61,21 @@ func providerLabel(_ session: RelaySession) -> String {
     session.provider.lowercased().contains("claude") ? "Claude Code" : "Codex"
 }
 
+// One list row: the session plus its nesting depth in the parent/child tree.
+struct SessionNode: Identifiable {
+    let session: RelaySession
+    let depth: Int
+    var id: String { session.key }
+}
+
+// Collapses control characters and runs of whitespace so the value fits on one line, e.g. for /rename.
+func oneLine(_ value: String) -> String {
+    let spaced = value.map { character in
+        character.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) } ? " " : character
+    }
+    return String(spaced).split(whereSeparator: \.isWhitespace).joined(separator: " ")
+}
+
 @MainActor
 final class SessionModel: ObservableObject {
     @Published private(set) var snapshot: SessionSnapshot?
@@ -86,9 +101,8 @@ final class SessionModel: ObservableObject {
     var runningSessions: [RelaySession] { sessions.filter { runningStatuses.contains($0.status.lowercased()) } }
     var waitingSessions: [RelaySession] { sessions.filter { attentionStatuses.contains($0.status.lowercased()) } }
     var failedSessions: [RelaySession] { sessions.filter { errorStatuses.contains($0.status.lowercased()) } }
-    var selectedSession: RelaySession? { sessions.first { $0.key == selectedKey } }
-
-    var visibleSessions: [RelaySession] {
+    // Base filter only. It never reads selection, so the derived lists below cannot recurse.
+    private var filteredSessions: [RelaySession] {
         let query = search.trimmingCharacters(in: .whitespaces).lowercased()
         return sessions.filter { session in
             (providerFilter == "all" || session.provider == providerFilter)
@@ -96,6 +110,39 @@ final class SessionModel: ObservableObject {
                 && matches(session, query: query)
         }
     }
+
+    // Parents come before their visible children. A child is indented only when its parent is also visible.
+    var visibleRows: [SessionNode] {
+        let base = filteredSessions
+        let visibleKeys = Set(base.map(\.key))
+        var children: [String: [RelaySession]] = [:]
+        var roots: [RelaySession] = []
+        for session in base {
+            if let parent = session.parent_key, parent != session.key, visibleKeys.contains(parent) {
+                children[parent, default: []].append(session)
+            } else {
+                roots.append(session)
+            }
+        }
+        var rows: [SessionNode] = []
+        var placed = Set<String>()
+        func place(_ session: RelaySession, depth: Int) {
+            guard placed.insert(session.key).inserted else { return }
+            rows.append(SessionNode(session: session, depth: depth))
+            for child in children[session.key] ?? [] { place(child, depth: depth + 1) }
+        }
+        for root in roots { place(root, depth: 0) }
+        // Parent cycles leave members unreachable from any root; surface them as top-level rows.
+        for session in base { place(session, depth: 0) }
+        return rows
+    }
+
+    var visibleSessions: [RelaySession] { visibleRows.map(\.session) }
+
+    // The inspector only acts on a selection that is currently visible, so hidden rows cannot be mutated.
+    var selectedSession: RelaySession? { visibleSessions.first { $0.key == selectedKey } }
+
+    func session(forKey key: String) -> RelaySession? { sessions.first { $0.key == key } }
 
     private func matches(_ session: RelaySession, query: String) -> Bool {
         if query.isEmpty { return true }
@@ -229,11 +276,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // Closing the window keeps the menu bar item alive; the Dock icon or menu reopens it.
+    // Closing the window keeps the menu bar item alive; the menu bar or a Finder relaunch reopens it.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        showWindow()
+        if window?.isVisible == true {
+            window?.makeKeyAndOrderFront(nil)
+        } else {
+            showPopover()
+        }
         return true
     }
 
@@ -265,6 +316,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(menuItem("Quit Relay", #selector(quitAction), key: "q"))
         appItem.submenu = appMenu
         mainMenu.addItem(appItem)
+
+        // Standard Edit menu. Actions go through the responder chain (nil target) so the focused text field handles them.
+        let editRoot = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(responderItem("Undo", Selector(("undo:")), key: "z"))
+        editMenu.addItem(responderItem("Redo", Selector(("redo:")), key: "z", modifiers: [.command, .shift]))
+        editMenu.addItem(.separator())
+        editMenu.addItem(responderItem("Cut", Selector(("cut:")), key: "x"))
+        editMenu.addItem(responderItem("Copy", Selector(("copy:")), key: "c"))
+        editMenu.addItem(responderItem("Paste", Selector(("paste:")), key: "v"))
+        editMenu.addItem(.separator())
+        editMenu.addItem(responderItem("Select All", Selector(("selectAll:")), key: "a"))
+        editRoot.submenu = editMenu
+        mainMenu.addItem(editRoot)
 
         let viewItem = NSMenuItem()
         let viewMenu = NSMenu(title: "View")
@@ -353,6 +418,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func menuItem(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
         item.target = self
+        return item
+    }
+
+    private func responderItem(_ title: String, _ action: Selector, key: String, modifiers: NSEvent.ModifierFlags = .command) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.keyEquivalentModifierMask = modifiers
         return item
     }
 
@@ -547,16 +618,28 @@ struct RelayPopoverView: View {
 
     private var attentionSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            sectionHeader("NEEDS ATTENTION", count: model.attentionSessions.count)
+            sectionHeader("NEEDS ATTENTION", countText: "\(model.attentionSessions.count)")
             ForEach(Array(model.attentionSessions.prefix(3)), id: \.key) { session in
                 TaskCard(session: session, onOpen: { actions.openSession(session.key) })
+            }
+            if model.attentionSessions.count > 3 {
+                Button("View all \(model.attentionSessions.count)", action: actions.openWorkspace)
+                    .buttonStyle(.link)
+                    .controlSize(.small)
             }
         }
     }
 
+    // Shows shown/total when the popover caps the list.
+    private var taskCountText: String {
+        let shown = model.activeTasks.count
+        let total = model.sessions.count
+        return shown < total ? "\(shown)/\(total)" : "\(total)"
+    }
+
     private var tasksSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            sectionHeader("CURRENT & RECENT WORK", count: model.activeTasks.count)
+            sectionHeader("CURRENT & RECENT WORK", countText: taskCountText)
             if model.sessions.isEmpty {
                 VStack(spacing: 6) {
                     Image(systemName: "tray").font(.title3).foregroundStyle(.secondary)
@@ -579,7 +662,7 @@ struct RelayPopoverView: View {
 
     private var providerSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            sectionHeader("PROVIDERS", count: nil)
+            sectionHeader("PROVIDERS", countText: nil)
             if model.providers.isEmpty {
                 Text("No provider data").font(.caption).foregroundStyle(.secondary)
             }
@@ -620,15 +703,15 @@ struct RelayPopoverView: View {
         .tint(.cyan)
     }
 
-    private func sectionHeader(_ title: String, count: Int?) -> some View {
+    private func sectionHeader(_ title: String, countText: String?) -> some View {
         HStack {
             Text(title)
                 .font(.caption2.weight(.semibold))
                 .tracking(0.8)
                 .foregroundStyle(.secondary)
             Spacer()
-            if let count {
-                Text("\(count)").font(.caption2).foregroundStyle(.tertiary).monospacedDigit()
+            if let countText {
+                Text(countText).font(.caption2).foregroundStyle(.secondary).monospacedDigit()
             }
         }
     }
@@ -653,6 +736,7 @@ struct TaskCard: View {
                         Text(session.name)
                             .font(.system(size: 13, weight: .semibold))
                             .lineLimit(1)
+                            .help(session.name)
                         Spacer(minLength: 4)
                         StatusChip(status: session.status)
                     }
@@ -663,12 +747,12 @@ struct TaskCard: View {
                     HStack(spacing: 5) {
                         Text(providerLabel(session))
                         Text("·")
-                        Text(session.project).lineLimit(1).truncationMode(.middle)
+                        Text(session.project).lineLimit(1).truncationMode(.middle).help(session.project)
                         Spacer(minLength: 4)
                         Text(session.last_activity).lineLimit(1)
                     }
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
                 }
             }
             .padding(10)
@@ -863,8 +947,8 @@ struct SessionListView: View {
                 )
             } else {
                 List(selection: $model.selectedKey) {
-                    ForEach(model.visibleSessions, id: \.key) { session in
-                        SessionRow(session: session).tag(session.key)
+                    ForEach(model.visibleRows) { node in
+                        SessionRow(session: node.session, depth: node.depth).tag(node.session.key)
                     }
                 }
                 .listStyle(.inset)
@@ -886,10 +970,12 @@ struct SessionListView: View {
 
 struct SessionRow: View {
     let session: RelaySession
+    // Depth is nonzero only when the parent row is visible in the same list.
+    let depth: Int
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            if session.parent_key != nil {
+            if depth > 0 {
                 Image(systemName: "arrow.turn.down.right")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -922,9 +1008,10 @@ struct SessionRow: View {
                 .foregroundStyle(.tertiary)
             }
         }
-        .padding(.leading, session.parent_key == nil ? 0 : 16)
+        .padding(.leading, CGFloat(depth) * 16)
         .padding(.vertical, 4)
         .accessibilityElement(children: .combine)
+        .accessibilityLabel(depth > 0 ? "Child session, \(session.name), \(session.status)" : "\(session.name), \(session.status)")
     }
 }
 
@@ -953,17 +1040,21 @@ struct SessionDetail: View {
     let session: RelaySession
     @ObservedObject var model: SessionModel
     @State private var draft: String
+    // The last saved alias the draft was synced to. Used to tell an untouched draft from an edited one.
+    @State private var syncedAlias: String
+    @State private var copiedNote: String?
 
     init(session: RelaySession, model: SessionModel) {
         self.session = session
         _model = ObservedObject(wrappedValue: model)
-        _draft = State(initialValue: session.display_name ?? "")
+        _draft = State(initialValue: session.alias ?? "")
+        _syncedAlias = State(initialValue: session.alias ?? "")
     }
 
     private var isCodex: Bool { session.provider.lowercased().contains("codex") }
     private var isClaude: Bool { session.provider.lowercased().contains("claude") }
     private var trimmedDraft: String { draft.trimmingCharacters(in: .whitespacesAndNewlines) }
-    private var isDirty: Bool { trimmedDraft != (session.display_name ?? "") }
+    private var isDirty: Bool { trimmedDraft != (session.alias ?? "") }
 
     private var resumeCommand: String {
         if isClaude { return "claude --resume \(shellQuoted(session.id))" }
@@ -974,7 +1065,7 @@ struct SessionDetail: View {
     var body: some View {
         Form {
             Section {
-                TextField("Local alias", text: $draft)
+                TextField("Local alias", text: $draft, prompt: Text(session.suggested_name ?? "Automatic name"))
                     .onSubmit { save() }
                 HStack {
                     Button("Save Alias") { save() }
@@ -986,7 +1077,7 @@ struct SessionDetail: View {
                         ProgressView().controlSize(.small)
                     }
                 }
-                Text("Aliases are saved locally by Relay. Saving an empty alias clears it.")
+                Text("Empty aliases show the suggested name. Saving an empty alias clears it.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } header: {
@@ -994,10 +1085,15 @@ struct SessionDetail: View {
             }
 
             Section {
-                Button("Copy Resume Command") { copyNative(resumeCommand) }
-                Button("Copy Session ID") { copyNative(session.id) }
+                Button("Copy Resume Command") { copy(resumeCommand, note: "Copied resume command") }
+                Button("Copy Session ID") { copy(session.id, note: "Copied session ID") }
                 if isClaude {
-                    Button("Copy /rename Command") { copyNative("/rename \(session.name)") }
+                    Button("Copy /rename Command") { copy("/rename \(oneLine(session.name))", note: "Copied /rename command") }
+                }
+                if let copiedNote {
+                    Label(copiedNote, systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
                 }
                 if isCodex {
                     Button("Sync Name to Codex…") { confirmSync() }
@@ -1022,7 +1118,17 @@ struct SessionDetail: View {
                 LabeledContent("Tokens", value: session.tokens.map { $0.formatted() } ?? "—")
                 LabeledContent("Project", value: session.project)
                 LabeledContent("Directory", value: session.cwd)
-                LabeledContent("Parent", value: session.parent_key ?? "None")
+                LabeledContent("Parent") {
+                    if let key = session.parent_key, let parent = model.session(forKey: key) {
+                        // Reveal clears filters so the parent is visible and selectable.
+                        Button(parent.name) { model.reveal(parent.key) }
+                            .buttonStyle(.link)
+                            .help("Show parent session")
+                            .accessibilityLabel("Show parent: \(parent.name)")
+                    } else {
+                        Text(session.parent_key ?? "None")
+                    }
+                }
             } header: {
                 Text("Provenance")
             }
@@ -1036,12 +1142,28 @@ struct SessionDetail: View {
         }
         .formStyle(.grouped)
         .textSelection(.enabled)
+        .onChange(of: session.alias) { newAlias in
+            // Follow an external alias change only when the draft was still untouched; unsaved edits survive polling.
+            let saved = newAlias ?? ""
+            if trimmedDraft == syncedAlias { draft = saved }
+            syncedAlias = saved
+        }
     }
 
     private func save() {
         guard isDirty, !model.busy else { return }
         let name = trimmedDraft
         Task { await model.saveName(session, name: name) }
+    }
+
+    // Copies, then shows a short confirmation. A newer copy keeps its own note visible.
+    private func copy(_ value: String, note: String) {
+        copyNative(value)
+        copiedNote = note
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            if copiedNote == note { copiedNote = nil }
+        }
     }
 
     // Explicit confirmation is required; nothing syncs on its own.

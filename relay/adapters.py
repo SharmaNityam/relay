@@ -134,6 +134,17 @@ def _status(status: str, source: str, at: str | None) -> tuple[str, str]:
     return status, source
 
 
+def _usable_at(at: str | None) -> bool:
+    """A missing, unparsable, or future timestamp cannot show that work is outstanding."""
+    epoch = _epoch(at)
+    return epoch is not None and epoch <= time.time() + 60
+
+
+def _refreshed_at(status: str, at: str | None, state_at: str | None) -> str | None:
+    """Assistant progress can keep a running state fresh, but never starts one."""
+    return at if status == "running" and _usable_at(at) else state_at
+
+
 def _safe_source_path(root: Path, candidate: Path) -> bool:
     """Only accept a known session path with no symlink in any path component."""
     try:
@@ -193,6 +204,16 @@ def _codex_events(events: list[dict[str, Any]], initial: str = "") -> dict[str, 
                     task = msg
                     status, status_source, activity = "unknown", "observed_user_request", "New user request observed"
                     state_at = at
+            elif kind == "item_completed":
+                # Completed tool items show recent activity only; they never mark the session completed.
+                item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+                item_type = item.get("type")
+                if item_type == "Reasoning":
+                    state_at = _refreshed_at(status, at, state_at)
+                elif item_type in ("CommandExecution", "McpToolCall"):
+                    label = clean_text(str(item.get("name") or item_type), 48)
+                    activity = f"Used {label}"
+                    state_at = _refreshed_at(status, at, state_at)
         elif typ == "response_item":
             kind = payload.get("type")
             if kind == "message":
@@ -201,10 +222,20 @@ def _codex_events(events: list[dict[str, Any]], initial: str = "") -> dict[str, 
                     task = msg
                     status, status_source, activity = "unknown", "observed_user_request", "New user request observed"
                     state_at = at
-            if kind in ("function_call", "custom_tool_call"):
+                elif payload.get("role") == "assistant" and payload.get("channel") == "final":
+                    # Only the channel marker is read; the message body is never inspected.
+                    status, status_source, activity = "completed", "observed_assistant_final", "Assistant final message"
+                    state_at = at
+                elif payload.get("role") == "assistant" and payload.get("channel") == "commentary":
+                    state_at = _refreshed_at(status, at, state_at)
+            elif kind == "reasoning":
+                state_at = _refreshed_at(status, at, state_at)
+            elif kind in ("function_call", "custom_tool_call"):
                 # Only the function/tool name is useful activity metadata. Never inspect args.
                 name = clean_text(str(payload.get("name") or payload.get("tool_name") or "tool"), 48)
                 activity = f"Used {name}"
+                if _usable_at(at):
+                    status, status_source, state_at = "running", "observed_tool_call", at
         elif typ in ("token_usage_record", "token_count"):
             usage = payload.get("total_token_usage") or payload.get("token_usage") or payload
             if isinstance(usage, dict):

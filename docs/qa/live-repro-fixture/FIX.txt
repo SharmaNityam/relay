@@ -1,0 +1,4 @@
+For the after-fix video shot, insert these lines before the return statement:
+    if quantity < 0:
+        raise ValueError("quantity must be non-negative")
+Reset app.py to the committed buggy fixture before a new recording.

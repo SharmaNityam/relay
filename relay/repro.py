@@ -502,13 +502,19 @@ class ReproManager:
         with self._lock:
             job = self._jobs.get(job_id)
             if not job: raise KeyError(job_id)
-            if job["status"] != "reproduced": raise ValueError("Only reproduced jobs can be verified")
+            retryable = (job["status"] == "error" and
+                         (job.get("baseline") or {}).get("outcome") == "assertion_failure")
+            if job["status"] != "reproduced" and not retryable:
+                raise ValueError("Only reproduced jobs can be verified")
             if _sha(job["test_code"].encode()) != job["test_hash"]:
                 raise ValueError("Generated test integrity check failed")
             if job["demo"]:
                 # Demo verification is available after demo-fix only.
                 if not job["demo_fixed"]: raise ValueError("Apply the demo fix before verification")
+            # Drop the previous attempt's outcome so a retry never shows a stale failure while running.
             job["status"], job["phase"] = "running", "verification"
+            job["verification"] = None
+            job["error"] = None
             self._pool.submit(self._verify_worker, job_id)
             return self._public(job)
 
@@ -533,6 +539,8 @@ class ReproManager:
             result = _run_test(Path(job["work"]))
             job["verification"] = result
             job["status"] = "verified" if result["outcome"] == "passed" else "error"
+            if result["outcome"] == "passed":
+                job["error"] = None
             self._event(job, "verification", "Unchanged test passed after the source fix" if result["outcome"] == "passed"
                         else "Verification did not pass")
         except Exception as exc:

@@ -106,3 +106,36 @@ def test_claude_expired_oauth_error_is_actionable_and_redacted(tmp_path, monkeyp
     result = _wait(manager, created["id"], "error")
     assert result["error"] == "Claude Code authentication expired. Sign in to Claude Code and retry."
     assert "CLAUDE_CANARY_123" not in str(result)
+
+
+def test_failed_verification_can_retry_same_test_without_another_model_call(tmp_path, monkeypatch):
+    source = tmp_path / 'repo'
+    source.mkdir()
+    (source / 'app.py').write_text(repro.DEMO_SOURCE)
+    generated = []
+    def generate(*args):
+        generated.append(True)
+        return repro.DEMO_TEST
+    monkeypatch.setattr(repro, '_generate', generate)
+    outcomes = iter([(1, 'Failed: DID NOT RAISE ValueError', None), (0, '1 passed', None)])
+    monkeypatch.setattr(repro, '_docker_run', lambda work: next(outcomes))
+    manager = repro.ReproManager(tmp_path / 'state')
+    try:
+        created = manager.create({'provider': 'claude', 'repo_path': str(source), 'issue': 'Reject negative quantities'})
+        baseline = _wait(manager, created['id'], 'reproduced')
+        manager.verify(created['id'])
+        failed = _wait(manager, created['id'], 'error')
+        assert failed['verification']['outcome'] == 'unchanged_source'
+        (source / 'app.py').write_text(repro.DEMO_FIXED)
+        retry = manager.verify(created['id'])
+        assert retry['verification'] is None and retry['error'] is None
+        verified = _wait(manager, created['id'], 'verified')
+        assert verified['test_code'] == baseline['test_code']
+        assert verified['verification']['outcome'] == 'passed'
+        assert verified['error'] is None
+        assert 'did not change' not in str(verified['verification'])
+        # Event history is kept as an audit trail of the earlier failed attempt.
+        assert any('did not change' in event['message'] for event in verified['events'])
+        assert len(generated) == 1
+    finally:
+        manager.shutdown()

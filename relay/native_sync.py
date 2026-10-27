@@ -9,10 +9,22 @@ import subprocess
 import time
 
 
+def _codex_executable() -> str | None:
+    executable = shutil.which("codex")
+    if executable:
+        return executable
+    # GUI launches have a minimal PATH. Also recognize the official desktop bundle.
+    for bundle in ("/Applications/ChatGPT.app", "/Applications/Codex.app"):
+        candidate = bundle + "/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def rename_codex(session_id: str, name: str, timeout: float = 10.0) -> dict:
     if not session_id or len(session_id) > 128 or not name.strip() or len(name) > 120:
         return {"ok": False, "message": "Invalid session ID or title"}
-    executable = shutil.which("codex")
+    executable = _codex_executable()
     if not executable:
         return {"ok": False, "message": "Codex CLI is unavailable"}
     # A fresh app-server renames a persisted thread by ID without resuming it.
@@ -76,7 +88,8 @@ def rename_codex(session_id: str, name: str, timeout: float = 10.0) -> dict:
             return {"ok": False, "message": "Codex app-server initialization failed"}
         send({"method": "initialized", "params": {}})
         send({"id": 2, "method": "thread/name/set", "params": {"threadId": session_id, "name": name.strip()}})
-        proc.stdin.close()
+        # EOF shuts down a real app-server before its asynchronous title update replies.
+        # Keep its input open until the response has arrived, then stop our child below.
         result = receive(2, deadline)
         if result is None:
             return {"ok": False, "message": "Codex app-server title update timed out"}

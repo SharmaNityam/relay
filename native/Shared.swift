@@ -8,6 +8,7 @@ struct RelaySession: Decodable, Identifiable {
     let key: String
     let title: String
     let display_name: String?
+    let alias: String?
     let suggested_name: String?
     let task: String
     let project: String
@@ -82,24 +83,41 @@ final class EngineClient {
         if (try? await data("/api/health")) != nil { return }
         if let starting { return try await starting.value }
         let task = Task<Void, Error> {
-            guard let file = Bundle.main.url(forResource: "backend-path", withExtension: "txt"),
-                  let raw = try? String(contentsOf: file, encoding: .utf8) else {
-                throw EngineError.message("Engine location is missing. Rebuild the app from its checkout.")
+            var env = ProcessInfo.processInfo.environment
+            let resources = Bundle.main.resourceURL!
+            let runtime = resources.appendingPathComponent("runtime", isDirectory: true)
+            let bundledPython = runtime.appendingPathComponent("bin/python3.12")
+            let executable: URL
+            let arguments: [String]
+            let directory: URL
+            if FileManager.default.isExecutableFile(atPath: bundledPython.path) {
+                executable = bundledPython
+                arguments = ["-m", "relay.cli", "serve", "--port", "9778"]
+                directory = resources
+                env["PYTHONHOME"] = runtime.path
+                env["PYTHONPATH"] = resources.appendingPathComponent("engine").path
+                env["PYTHONNOUSERSITE"] = "1"
+            } else {
+                guard let file = Bundle.main.url(forResource: "backend-path", withExtension: "txt"),
+                      let raw = try? String(contentsOf: file, encoding: .utf8) else {
+                    throw EngineError.message("The engine is missing from this app. Reinstall the complete app bundle.")
+                }
+                let root = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                executable = URL(fileURLWithPath: root + "/.venv/bin/relay")
+                arguments = ["serve", "--port", "9778"]
+                directory = URL(fileURLWithPath: root)
             }
-            let root = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            let executable = root + "/.venv/bin/relay"
-            guard FileManager.default.isExecutableFile(atPath: executable) else {
-                throw EngineError.message("Local engine is unavailable. Run uv sync in the checkout, then retry.")
+            guard FileManager.default.isExecutableFile(atPath: executable.path) else {
+                throw EngineError.message("Local engine is unavailable. Reinstall the app or rebuild its environment.")
             }
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = ["serve", "--port", "9778"]
-            process.currentDirectoryURL = URL(fileURLWithPath: root)
+            process.executableURL = executable
+            process.arguments = arguments
+            process.currentDirectoryURL = directory
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
             // GUI launches do not inherit a shell PATH; include installed tool locations.
-            var env = ProcessInfo.processInfo.environment
-            env["PATH"] = FileManager.default.homeDirectoryForCurrentUser.path + "/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            env["PATH"] = FileManager.default.homeDirectoryForCurrentUser.path + "/.local/bin:" + FileManager.default.homeDirectoryForCurrentUser.path + "/.docker/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
             process.environment = env
             try process.run()
             self.process = process
@@ -107,7 +125,7 @@ final class EngineClient {
                 if (try? await self.data("/api/health")) != nil { return }
                 try await Task.sleep(nanoseconds: 250_000_000)
             }
-            throw EngineError.message("The local engine did not start. Check the checkout and retry.")
+            throw EngineError.message("The local engine did not start. Retry or reinstall the app.")
         }
         starting = task
         defer { starting = nil }
@@ -144,7 +162,16 @@ func copyNative(_ value: String) {
 
 func openSiblingApp(_ name: String) {
     let url = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent(name + ".app")
-    NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+    NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+        if let error {
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = "Couldn’t open \(name)"
+                alert.informativeText = "Keep Relay.app and Repro.app in the same folder. \(error.localizedDescription)"
+                alert.runModal()
+            }
+        }
+    }
 }
 
 // Real system Liquid Glass on macOS 26+, native vibrancy on older supported Macs.
